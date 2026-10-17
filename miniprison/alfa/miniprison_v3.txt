@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>MiniPrison — NPCs</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #1a1a2e;
+    overflow: hidden;
+    height: 100%;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+"use strict";
+
+/* =========================================================
+   CONFIGURACIÓN GLOBAL
+   ========================================================= */
+const TILE = 40;              // tamaño de cada celda en píxeles
+const COLS = 20;              // celdas horizontales
+const ROWS = 15;              // celdas verticales
+const GRID_W = TILE * COLS;   // ancho lógico del grid
+const GRID_H = TILE * ROWS;   // alto lógico del grid
+
+const COLOR_BG = "#1a1a2e";
+const COLOR_GRID = "rgba(255,255,255,0.08)";
+
+const TICK_MS = 1000;         // intervalo de la simulación por ticks
+
+// Parámetros de los NPCs
+const NPC_RADIUS = 10;             // radio del círculo
+const VISION_RADIUS = 80;          // alcance del cono de visión
+const VISION_FOV = Math.PI / 3;    // apertura total (60°)
+const VISION_ALPHA = 0.15;         // transparencia del cono
+
+// Colores por tipo
+const NPC_COLORS = {
+  preso:   "#ff4444",
+  guardia: "#4488ff",
+  obrero:  "#ffcc44"
+};
+
+// Velocidades por tipo (px por segundo)
+const NPC_SPEEDS = {
+  preso:   60,
+  guardia: 90,
+  obrero:  70
+};
+
+/* =========================================================
+   CANVAS A PANTALLA COMPLETA (con soporte HiDPI)
+   ========================================================= */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = Math.floor(window.innerWidth  * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+  canvas.style.width  = window.innerWidth  + "px";
+  canvas.style.height = window.innerHeight + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+/* =========================================================
+   INPUT DE TECLADO
+   ========================================================= */
+const keys = Object.create(null);
+
+window.addEventListener("keydown", (e) => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === " " || e.key.startsWith("Arrow")) e.preventDefault();
+});
+window.addEventListener("keyup", (e) => {
+  keys[e.key.toLowerCase()] = false;
+});
+window.addEventListener("blur", () => {
+  for (const k in keys) keys[k] = false;
+});
+
+/* =========================================================
+   OFFSET DEL GRID (centrado en pantalla)
+   ========================================================= */
+// Calculamos el offset una sola vez por frame y lo compartimos con los NPCs
+// para que sus coordenadas "de mundo" (0..GRID_W, 0..GRID_H) se dibujen bien.
+function getGridOffset() {
+  return {
+    x: Math.floor((window.innerWidth  - GRID_W) / 2),
+    y: Math.floor((window.innerHeight - GRID_H) / 2)
+  };
+}
+
+/* =========================================================
+   SISTEMA DE NPCs
+   ========================================================= */
+let nextNPCId = 1;
+
+/** Crea un NPC con valores por defecto según su tipo. */
+function crearNPC(tipo, x, y) {
+  return {
+    id: nextNPCId++,
+    tipo,                           // "preso" | "guardia" | "obrero"
+    x, y,                           // posición en píxeles (mundo)
+    angle: Math.random() * Math.PI * 2, // dirección actual
+    speed: NPC_SPEEDS[tipo],        // velocidad en px/seg
+    targetX: x,                     // objetivo actual
+    targetY: y,
+    color: NPC_COLORS[tipo]
+  };
+}
+
+/** Elige un nuevo objetivo aleatorio dentro del grid (celda al azar). */
+function elegirTargetAleatorio(npc) {
+  const tx = Math.floor(Math.random() * COLS);
+  const ty = Math.floor(Math.random() * ROWS);
+  // Centro de la celda elegida
+  npc.targetX = tx * TILE + TILE / 2;
+  npc.targetY = ty * TILE + TILE / 2;
+}
+
+/** Interpolación angular suave (evita el salto 359°→0°). */
+function lerpAngle(a, b, t) {
+  let diff = ((b - a + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  return a + diff * t;
+}
+
+/** Actualiza posición y ángulo del NPC en un frame (delta time en segundos). */
+function actualizarNPC(npc, dt) {
+  const dx = npc.targetX - npc.x;
+  const dy = npc.targetY - npc.y;
+  const dist = Math.hypot(dx, dy);
+
+  // Si ya estamos muy cerca, elegimos un nuevo objetivo
+  if (dist < 2) {
+    elegirTargetAleatorio(npc);
+    return;
+  }
+
+  // Dirección deseada
+  const dirDeseada = Math.atan2(dy, dx);
+
+  // Interpolación suave del ángulo (ajustamos rápido pero sin saltos bruscos)
+  // t dependiente del dt para que sea estable a 60fps
+  const t = Math.min(1, dt * 8);
+  npc.angle = lerpAngle(npc.angle, dirDeseada, t);
+
+  // Movimiento hacia el objetivo
+  const step = npc.speed * dt;
+  if (step >= dist) {
+    npc.x = npc.targetX;
+    npc.y = npc.targetY;
+  } else {
+    npc.x += Math.cos(dirDeseada) * step;
+    npc.y += Math.sin(dirDeseada) * step;
+  }
+}
+
+/* =========================================================
+   DIBUJO DE NPCs
+   ========================================================= */
+/** Convierte color hex a rgba con alpha. */
+function hexToRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+/** Dibuja el NPC (cono + círculo) usando coordenadas de pantalla. */
+function dibujarNPC(ctx, npc, offsetX, offsetY) {
+  const sx = npc.x + offsetX;
+  const sy = npc.y + offsetY;
+
+  // --- Cono de visión ---
+  const a1 = npc.angle - VISION_FOV / 2;
+  const a2 = npc.angle + VISION_FOV / 2;
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(sx + Math.cos(a1) * VISION_RADIUS,
+             sy + Math.sin(a1) * VISION_RADIUS);
+  ctx.lineTo(sx + Math.cos(a2) * VISION_RADIUS,
+             sy + Math.sin(a2) * VISION_RADIUS);
+  ctx.closePath();
+  ctx.fillStyle = hexToRgba(npc.color, VISION_ALPHA);
+  ctx.fill();
+
+  // --- Cuerpo (círculo con borde blanco) ---
+  ctx.beginPath();
+  ctx.arc(sx, sy, NPC_RADIUS, 0, Math.PI * 2);
+  ctx.fillStyle = npc.color;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#ffffff";
+  ctx.stroke();
+}
+
+/* =========================================================
+   POBLAR EL MUNDO
+   ========================================================= */
+const npcs = [];
+
+/** Genera una posición aleatoria válida dentro del grid (en píxeles). */
+function posAleatoria() {
+  return {
+    x: TILE / 2 + Math.random() * (GRID_W - TILE),
+    y: TILE / 2 + Math.random() * (GRID_H - TILE)
+  };
+}
+
+function poblarMundo() {
+  const spawn = (tipo, n) => {
+    for (let i = 0; i < n; i++) {
+      const p = posAleatoria();
+      const npc = crearNPC(tipo, p.x, p.y);
+      elegirTargetAleatorio(npc);
+      npcs.push(npc);
+    }
+  };
+  spawn("preso", 5);
+  spawn("guardia", 2);
+  spawn("obrero", 1);
+}
+poblarMundo();
+
+/* =========================================================
+   SISTEMA DE TICKS (por si luego añadimos lógica lenta)
+   ========================================================= */
+let lastTick = performance.now();
+function tick() {
+  // Reservado para lógica de simulación "lenta" (necesidades, dinero…)
+}
+
+/* =========================================================
+   FPS
+   ========================================================= */
+let fpsAccum = 0;
+let fpsFrames = 0;
+let fpsValue = 0;
+
+/* =========================================================
+   DIBUJO GENERAL
+   ========================================================= */
+function drawGrid(offsetX, offsetY) {
+  // Fondo del grid
+  ctx.fillStyle = "#151526";
+  ctx.fillRect(offsetX, offsetY, GRID_W, GRID_H);
+
+  // Líneas
+  ctx.strokeStyle = COLOR_GRID;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x <= COLS; x++) {
+    const px = offsetX + x * TILE + 0.5;
+    ctx.moveTo(px, offsetY);
+    ctx.lineTo(px, offsetY + GRID_H);
+  }
+  for (let y = 0; y <= ROWS; y++) {
+    const py = offsetY + y * TILE + 0.5;
+    ctx.moveTo(offsetX, py);
+    ctx.lineTo(offsetX + GRID_W, py);
+  }
+  ctx.stroke();
+
+  // Borde exterior
+  ctx.strokeStyle = "rgba(255,255,255,0.18)";
+  ctx.strokeRect(offsetX + 0.5, offsetY + 0.5, GRID_W, GRID_H);
+}
+
+function drawFPS() {
+  ctx.font = "14px monospace";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#e0e0e0";
+  ctx.fillText(`FPS: ${fpsValue}`, 10, 10);
+  ctx.fillText(`NPCs: ${npcs.length}`, 10, 28);
+}
+
+function draw() {
+  const off = getGridOffset();
+
+  // Fondo global
+  ctx.fillStyle = COLOR_BG;
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+  drawGrid(off.x, off.y);
+
+  // NPCs (por encima del grid)
+  for (const npc of npcs) {
+    dibujarNPC(ctx, npc, off.x, off.y);
+  }
+
+  drawFPS();
+}
+
+/* =========================================================
+   BUCLE PRINCIPAL
+   ========================================================= */
+let lastFrameTime = performance.now();
+
+function loop(now) {
+  const dtMs = now - lastFrameTime;
+  lastFrameTime = now;
+  const dt = Math.min(dtMs / 1000, 0.05); // dt en segundos, clamp anti-saltos
+
+  // --- Ticks de simulación ---
+  let ticksRun = 0;
+  while (now - lastTick >= TICK_MS && ticksRun < 5) {
+    lastTick += TICK_MS;
+    tick();
+    ticksRun++;
+  }
+  if (now - lastTick >= TICK_MS) lastTick = now;
+
+  // --- Actualización de NPCs (movimiento suave por frame) ---
+  for (const npc of npcs) actualizarNPC(npc, dt);
+
+  // --- FPS ---
+  fpsAccum += dtMs;
+  fpsFrames++;
+  if (fpsAccum >= 500) {
+    fpsValue = Math.round((fpsFrames * 1000) / fpsAccum);
+    fpsAccum = 0;
+    fpsFrames = 0;
+  }
+
+  // --- Render ---
+  draw();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

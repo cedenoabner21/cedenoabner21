@@ -1,0 +1,1394 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>MiniPrison — v11</title>
+<style>
+  html, body { margin:0; padding:0; background:#1a1a2e; overflow:hidden; height:100%; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+"use strict";
+
+/* =========================================================
+   CONFIGURACIÓN GLOBAL
+   ========================================================= */
+const TILE = 40;
+const COLS = 28;
+const ROWS = 18;
+const GRID_W = TILE * COLS;
+const GRID_H = TILE * ROWS;
+
+const COLOR_BG = "#1a1a2e";
+const COLOR_GRID = "rgba(255,255,255,0.08)";
+
+const TICK_MS = 1000;
+const TICKS_POR_DIA = 60;
+const MINUTOS_POR_DIA = 1440;
+
+const NPC_RADIUS = 10;
+const VISION_RADIUS = 80;
+const VISION_FOV = Math.PI / 3;
+const VISION_ALPHA = 0.15;
+
+const NPC_COLORS = {
+  preso:   "#ff4444",
+  guardia: "#4488ff",
+  obrero:  "#ffcc44"
+};
+
+const NPC_SPEEDS = {
+  preso:   60,
+  guardia: 90,
+  obrero:  70
+};
+
+const SPEED_INQUIETO = 1.6;
+
+/* =========================================================
+   CONDICIONES DE JUEGO
+   ========================================================= */
+const DIA_VICTORIA      = 10;
+const PRESOS_PARA_GANAR = 20;
+const PRESOS_MINIMOS    = 5;
+const MOTINES_MAX       = 3;
+const FUGAS_MAX         = 3;
+
+const SPAWN_COL = 0;
+const SPAWN_ROW = 0;
+
+/* =========================================================
+   TIPOS DE CELDA
+   ========================================================= */
+const TIPOS_CELDA = {
+  vacio:   { color: null,      coste: 0  },
+  muro:    { color: "#555555", coste: 10 },
+  celda:   { color: "#333355", coste: 50 },
+  comedor: { color: "#335533", coste: 30 },
+  ducha:   { color: "#334455", coste: 30 },
+  patio:   { color: "#555533", coste: 20 }
+};
+
+const TECLAS_TIPO = ["vacio", "muro", "celda", "comedor", "ducha", "patio"];
+
+const FASE_AMANECER = { r: 255, g: 140, b: 60,  a: 0.10 };
+const FASE_MEDIODIA = { r: 255, g: 230, b: 180, a: 0.03 };
+const FASE_TARDE    = { r: 255, g: 120, b: 60,  a: 0.09 };
+const FASE_NOCHE    = { r: 10,  g: 10,  b: 40,  a: 0.22 };
+
+/* =========================================================
+   CANVAS
+   ========================================================= */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = Math.floor(window.innerWidth  * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+  canvas.style.width  = window.innerWidth  + "px";
+  canvas.style.height = window.innerHeight + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+/* =========================================================
+   INPUT
+   ========================================================= */
+const keys = Object.create(null);
+let espacioPulsado = false;
+
+window.addEventListener("keydown", (e) => {
+  if (e.key === " " || e.key.startsWith("Arrow")) e.preventDefault();
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  if (k >= "1" && k <= "6") tipoSeleccionado = TECLAS_TIPO[parseInt(k, 10) - 1];
+  if (k === " " && !e.repeat && !espacioPulsado && !estadoGlobal.finDePartida) {
+    espacioPulsado = true;
+    estadoGlobal.pausado = !estadoGlobal.pausado;
+  }
+  if (k === "r" && !e.repeat && estadoGlobal.finDePartida) reiniciarPartida();
+});
+window.addEventListener("keyup", (e) => {
+  const k = e.key.toLowerCase();
+  keys[k] = false;
+  if (k === " ") espacioPulsado = false;
+});
+window.addEventListener("blur", () => {
+  for (const k in keys) keys[k] = false;
+  espacioPulsado = false;
+});
+
+/* =========================================================
+   RATÓN
+   ========================================================= */
+let tipoSeleccionado = "muro";
+let mouseDown = false;
+let lastPaintCol = -1;
+let lastPaintRow = -1;
+
+function pantallaACelda(px, py) {
+  const off = getGridOffset();
+  const gx = px - off.x;
+  const gy = py - off.y;
+  if (gx < 0 || gy < 0 || gx >= GRID_W || gy >= GRID_H) return null;
+  return { col: Math.floor(gx / TILE), row: Math.floor(gy / TILE) };
+}
+
+function pintarCelda(col, row, tipo) {
+  if (col < 0 || row < 0 || col >= COLS || row >= ROWS) return false;
+  if (estadoGlobal.finDePartida) return false;
+  const celda = grid[row][col];
+  if (celda.tipo === "vacio" && tipo === "vacio") return false;
+  if (celda.tipo === tipo) return false;
+  const coste = TIPOS_CELDA[tipo].coste;
+  if (estadoGlobal.dinero < coste) return false;
+  estadoGlobal.dinero -= coste;
+
+  if (celda.tipo === "celda" && tipo !== "celda" && celda.asignada) {
+    celda.asignada = false;
+    for (let i = 0; i < npcs.length; i++) {
+      const n = npcs[i];
+      if (n.tipo === "preso" && n.celdaAsignada &&
+          n.celdaAsignada.col === col && n.celdaAsignada.row === row) {
+        n.celdaAsignada = null;
+        n.recienLlegado = false;
+      }
+    }
+  }
+
+  celda.tipo = tipo;
+  if (tipo === "celda") celda.asignada = false;
+  gridDirty = true;
+  return true;
+}
+
+canvas.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  if (estadoGlobal.finDePartida) return;
+  const celda = pantallaACelda(e.clientX, e.clientY);
+  if (!celda) return;
+  mouseDown = true;
+  pintarCelda(celda.col, celda.row, tipoSeleccionado);
+  lastPaintCol = celda.col;
+  lastPaintRow = celda.row;
+});
+canvas.addEventListener("mousemove", (e) => {
+  if (!mouseDown) return;
+  const celda = pantallaACelda(e.clientX, e.clientY);
+  if (!celda) return;
+  pintarLinea(lastPaintCol, lastPaintRow, celda.col, celda.row);
+  lastPaintCol = celda.col;
+  lastPaintRow = celda.row;
+});
+window.addEventListener("mouseup", () => {
+  mouseDown = false;
+  lastPaintCol = -1;
+  lastPaintRow = -1;
+});
+
+function pintarLinea(c0, r0, c1, r1) {
+  if (c1 < 0 || r1 < 0) return;
+  if (c0 < 0 || r0 < 0) { pintarCelda(c1, r1, tipoSeleccionado); return; }
+  let dc = Math.abs(c1 - c0), dr = Math.abs(r1 - r0);
+  let sc = c0 < c1 ? 1 : -1, sr = r0 < r1 ? 1 : -1;
+  let err = dc - dr, c = c0, r = r0;
+  while (true) {
+    pintarCelda(c, r, tipoSeleccionado);
+    if (c === c1 && r === r1) break;
+    const e2 = 2 * err;
+    if (e2 > -dr) { err -= dr; c += sc; }
+    if (e2 <  dc) { err += dc; r += sr; }
+  }
+}
+
+/* =========================================================
+   OFFSET
+   ========================================================= */
+function getGridOffset() {
+  return {
+    x: Math.floor((window.innerWidth  - GRID_W) / 2),
+    y: Math.floor((window.innerHeight - GRID_H) / 2)
+  };
+}
+
+/* =========================================================
+   GRID
+   ========================================================= */
+const grid = [];
+for (let r = 0; r < ROWS; r++) {
+  const fila = [];
+  for (let c = 0; c < COLS; c++) fila.push({ tipo: "vacio", asignada: false });
+  grid.push(fila);
+}
+
+let gridDirty = true;
+
+const gridCanvas = document.createElement("canvas");
+gridCanvas.width  = GRID_W;
+gridCanvas.height = GRID_H;
+const gridCtx = gridCanvas.getContext("2d");
+
+function celdaEsTransitable(col, row) {
+  if (col < 0 || row < 0 || col >= COLS || row >= ROWS) return false;
+  return grid[row][col].tipo !== "muro";
+}
+
+function puntoEnMuro(x, y) {
+  const col = Math.floor(x / TILE);
+  const row = Math.floor(y / TILE);
+  if (col < 0 || row < 0 || col >= COLS || row >= ROWS) return true;
+  return grid[row][col].tipo === "muro";
+}
+
+const indiceCeldasPorTipo = new Map();
+
+function reconstruirIndiceCeldas() {
+  indiceCeldasPorTipo.clear();
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const tipo = grid[r][c].tipo;
+      let arr = indiceCeldasPorTipo.get(tipo);
+      if (!arr) { arr = []; indiceCeldasPorTipo.set(tipo, arr); }
+      arr.push({ col: c, row: r });
+    }
+  }
+}
+
+function redibujarGridCache() {
+  gridCtx.clearRect(0, 0, GRID_W, GRID_H);
+  gridCtx.fillStyle = "#151526";
+  gridCtx.fillRect(0, 0, GRID_W, GRID_H);
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const tipo = grid[r][c].tipo;
+      const color = TIPOS_CELDA[tipo].color;
+      if (color) {
+        gridCtx.fillStyle = color;
+        gridCtx.fillRect(c * TILE, r * TILE, TILE, TILE);
+      }
+      if (tipo === "celda" && grid[r][c].asignada) {
+        gridCtx.fillStyle = "rgba(255,255,255,0.35)";
+        gridCtx.beginPath();
+        gridCtx.arc(c * TILE + TILE / 2, r * TILE + TILE / 2, 4, 0, Math.PI * 2);
+        gridCtx.fill();
+      }
+    }
+  }
+
+  gridCtx.strokeStyle = COLOR_GRID;
+  gridCtx.lineWidth = 1;
+  gridCtx.beginPath();
+  for (let x = 0; x <= COLS; x++) {
+    const px = x * TILE + 0.5;
+    gridCtx.moveTo(px, 0); gridCtx.lineTo(px, GRID_H);
+  }
+  for (let y = 0; y <= ROWS; y++) {
+    const py = y * TILE + 0.5;
+    gridCtx.moveTo(0, py); gridCtx.lineTo(GRID_W, py);
+  }
+  gridCtx.stroke();
+
+  gridCtx.strokeStyle = "rgba(255,255,255,0.18)";
+  gridCtx.strokeRect(0.5, 0.5, GRID_W, GRID_H);
+
+  gridCtx.fillStyle = "rgba(255,200,100,0.18)";
+  gridCtx.fillRect(SPAWN_COL * TILE, SPAWN_ROW * TILE, TILE, TILE);
+  gridCtx.strokeStyle = "rgba(255,200,100,0.6)";
+  gridCtx.lineWidth = 2;
+  gridCtx.strokeRect(SPAWN_COL * TILE + 1, SPAWN_ROW * TILE + 1, TILE - 2, TILE - 2);
+
+  reconstruirIndiceCeldas();
+  gridDirty = false;
+}
+
+/* =========================================================
+   ESTADO GLOBAL
+   ========================================================= */
+const estadoGlobal = {
+  dinero: 1000,
+  dia: 1,
+  tickDelDia: 0,
+  pausado: false,
+  resultado: null,
+  finDePartida: false,
+  motivoFin: "",
+  motinesActuales: 0,
+  ultimoDiaCerrado: 0,
+  fugas: 0
+};
+
+function puedeSimular() {
+  return !estadoGlobal.pausado && !estadoGlobal.finDePartida;
+}
+
+/* =========================================================
+   NPCs
+   ========================================================= */
+let nextNPCId = 1;
+const npcs = [];
+const presosEnMotin = [];
+
+function crearPreso(x, y, celdaDestino) {
+  return {
+    id: nextNPCId++,
+    tipo: "preso",
+    x, y,
+    angle: Math.random() * Math.PI * 2,
+    speed: NPC_SPEEDS.preso,
+    speedBase: NPC_SPEEDS.preso,
+    targetX: x,
+    targetY: y,
+    color: NPC_COLORS.preso,
+    hambre: 80 + Math.random() * 20,
+    higiene: 80 + Math.random() * 20,
+    libertad: 80 + Math.random() * 20,
+    estado: "normal",
+    objetivo: null,
+    objetivoTipo: null,     // v11: tipo de celda buscado (para excluir la actual)
+    celdaAsignada: celdaDestino,
+    recienLlegado: celdaDestino !== null,
+    huyendo: false,
+    cooldownLlegada: 0       // v11: ticks de espera tras llegar
+  };
+}
+
+function crearGuardia(x, y) {
+  return {
+    id: nextNPCId++, tipo: "guardia", x, y,
+    angle: Math.random() * Math.PI * 2,
+    speed: NPC_SPEEDS.guardia, speedBase: NPC_SPEEDS.guardia,
+    targetX: x, targetY: y,
+    color: NPC_COLORS.guardia,
+    objetivo: null, presoObjetivo: null, detectoMotin: false
+  };
+}
+
+function crearObrero(x, y) {
+  return {
+    id: nextNPCId++, tipo: "obrero", x, y,
+    angle: Math.random() * Math.PI * 2,
+    speed: NPC_SPEEDS.obrero, speedBase: NPC_SPEEDS.obrero,
+    targetX: x, targetY: y,
+    color: NPC_COLORS.obrero,
+    objetivo: null
+  };
+}
+
+/* =========================================================
+   BFS — v11: acepta excluirCol/excluirRow para no devolver
+   la celda actual del NPC si busca el mismo tipo.
+   ========================================================= */
+function bfsCeldaMasCercana(startCol, startRow, tipoBuscado, soloNoAsignadas, excluirCol, excluirRow) {
+  if (startCol < 0 || startRow < 0 || startCol >= COLS || startRow >= ROWS) return null;
+  const visitado = new Uint8Array(COLS * ROWS);
+  const cola = [{ col: startCol, row: startRow }];
+  visitado[startRow * COLS + startCol] = 1;
+  let head = 0;
+  const dirs = [[0,-1],[0,1],[-1,0],[1,0]];
+
+  while (head < cola.length) {
+    const nodo = cola[head++];
+    const col = nodo.col, row = nodo.row;
+    const celda = grid[row][col];
+
+    if (celda.tipo === tipoBuscado) {
+      const esNoAsignada = !soloNoAsignadas || (tipoBuscado === "celda" ? !celda.asignada : true);
+      const esDistinta = (col !== excluirCol || row !== excluirRow);
+      if (esNoAsignada && esDistinta) return { col, row };
+    }
+
+    for (let d = 0; d < 4; d++) {
+      const nc = col + dirs[d][0];
+      const nr = row + dirs[d][1];
+      if (nc < 0 || nr < 0 || nc >= COLS || nr >= ROWS) continue;
+      const idx = nr * COLS + nc;
+      if (visitado[idx]) continue;
+      if (grid[nr][nc].tipo === "muro") continue;
+      visitado[idx] = 1;
+      cola.push({ col: nc, row: nr });
+    }
+  }
+  return null;
+}
+
+function celdaDePunto(x, y) {
+  return {
+    col: Math.max(0, Math.min(COLS - 1, Math.floor(x / TILE))),
+    row: Math.max(0, Math.min(ROWS - 1, Math.floor(y / TILE)))
+  };
+}
+
+/* =========================================================
+   ASIGNACIÓN DE CELDA
+   ========================================================= */
+function asignarCeldaAPreso(preso) {
+  const destino = bfsCeldaMasCercana(SPAWN_COL, SPAWN_ROW, "celda", true, -1, -1);
+  if (destino) {
+    grid[destino.row][destino.col].asignada = true;
+    preso.celdaAsignada = destino;
+    preso.recienLlegado = true;
+    preso.targetX = destino.col * TILE + TILE / 2;
+    preso.targetY = destino.row * TILE + TILE / 2;
+    preso.objetivo = "celda";
+    return true;
+  }
+  preso.celdaAsignada = null;
+  preso.recienLlegado = false;
+  return false;
+}
+
+function spawnearPreso() {
+  const x = SPAWN_COL * TILE + TILE / 2;
+  const y = SPAWN_ROW * TILE + TILE / 2;
+  const preso = crearPreso(x, y, null);
+  asignarCeldaAPreso(preso);
+  npcs.push(preso);
+  return preso;
+}
+
+/* =========================================================
+   LÓGICA DE NECESIDADES
+   v11: el BFS excluye la celda actual del NPC, así no se
+   queda en bucle "ya llegué, busco otra, es la misma".
+   ========================================================= */
+function asignarTargetATipo(npc, tipoCelda, motivo) {
+  const p = celdaDePunto(npc.x, npc.y);
+  const destino = bfsCeldaMasCercana(p.col, p.row, tipoCelda, false, p.col, p.row);
+  if (destino) {
+    npc.targetX = destino.col * TILE + TILE / 2;
+    npc.targetY = destino.row * TILE + TILE / 2;
+    npc.objetivo = motivo;
+    npc.objetivoTipo = tipoCelda;
+    return true;
+  }
+  return false;
+}
+
+function asignarTargetAleatorioDeTipo(npc, tipoCelda, motivo) {
+  const arr = indiceCeldasPorTipo.get(tipoCelda);
+  if (!arr || arr.length === 0) return false;
+  // v11: filtrar la celda actual del NPC para evitar bucles
+  const p = celdaDePunto(npc.x, npc.y);
+  const candidatos = [];
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i].col !== p.col || arr[i].row !== p.row) candidatos.push(arr[i]);
+  }
+  // Si solo queda su celda, no asignar (evita bucle)
+  if (candidatos.length === 0) {
+    // Fallback: buscar celda de tipo "vacio" distinta a la actual
+    const vacios = indiceCeldasPorTipo.get("vacio");
+    if (vacios) {
+      const vaciosFiltrados = [];
+      for (let i = 0; i < vacios.length; i++) {
+        if (vacios[i].col !== p.col || vacios[i].row !== p.row) vaciosFiltrados.push(vacios[i]);
+      }
+      if (vaciosFiltrados.length > 0) {
+        const dest = vaciosFiltrados[Math.floor(Math.random() * vaciosFiltrados.length)];
+        npc.targetX = dest.col * TILE + TILE / 2;
+        npc.targetY = dest.row * TILE + TILE / 2;
+        npc.objetivo = motivo;
+        npc.objetivoTipo = "vacio";
+        return true;
+      }
+    }
+    return false;
+  }
+  const dest = candidatos[Math.floor(Math.random() * candidatos.length)];
+  npc.targetX = dest.col * TILE + TILE / 2;
+  npc.targetY = dest.row * TILE + TILE / 2;
+  npc.objetivo = motivo;
+  npc.objetivoTipo = tipoCelda;
+  return true;
+}
+
+function enDestino(npc) {
+  const dx = npc.targetX - npc.x;
+  const dy = npc.targetY - npc.y;
+  return Math.sqrt(dx * dx + dy * dy) < 4;
+}
+
+function resolverLlegada(npc) {
+  if (npc.tipo !== "preso") return;
+  if (npc.objetivo === "comedor") npc.hambre = 100;
+  else if (npc.objetivo === "ducha") npc.higiene = 100;
+  else if (npc.objetivo === "celda") {
+    npc.libertad = Math.min(100, npc.libertad + 5);
+    if (npc.recienLlegado) npc.recienLlegado = false;
+  }
+  npc.objetivo = null;
+  npc.objetivoTipo = null;
+  // v11: cooldown para evitar reasignar el mismo tipo inmediatamente
+  npc.cooldownLlegada = 2;
+  npc.targetX = npc.x;
+  npc.targetY = npc.y;
+}
+
+/* =========================================================
+   DETECCIÓN DE HUIDA
+   ========================================================= */
+function puedeHuir(preso) {
+  if (preso.recienLlegado) return false;
+  if (!preso.celdaAsignada) return false;
+  const c = preso.celdaAsignada.col;
+  const r = preso.celdaAsignada.row;
+  if (c === 0 || c === COLS - 1 || r === 0 || r === ROWS - 1) return true;
+  const vecinos = [[c-1,r],[c+1,r],[c,r-1],[c,r+1]];
+  for (let i = 0; i < 4; i++) {
+    const nc = vecinos[i][0], nr = vecinos[i][1];
+    if (nc < 0 || nr < 0 || nc >= COLS || nr >= ROWS) continue;
+    if (grid[nr][nc].tipo === "muro") continue;
+    if (nc === 0 || nc === COLS - 1 || nr === 0 || nr === ROWS - 1) return true;
+  }
+  return false;
+}
+
+function iniciarHuida(preso) {
+  let mejor = null, mejorDist = Infinity;
+  const candidatos = [];
+  for (let c = 0; c < COLS; c++) { candidatos.push({col:c,row:0}); candidatos.push({col:c,row:ROWS-1}); }
+  for (let r = 0; r < ROWS; r++) { candidatos.push({col:0,row:r}); candidatos.push({col:COLS-1,row:r}); }
+  for (let i = 0; i < candidatos.length; i++) {
+    const cand = candidatos[i];
+    if (grid[cand.row][cand.col].tipo === "muro") continue;
+    const dx = cand.col * TILE + TILE/2 - preso.x;
+    const dy = cand.row * TILE + TILE/2 - preso.y;
+    const d = dx*dx + dy*dy;
+    if (d < mejorDist) { mejorDist = d; mejor = cand; }
+  }
+  if (!mejor) return false;
+  preso.huyendo = true;
+  preso.estado = "huyendo";
+  preso.speed = preso.speedBase * SPEED_INQUIETO;
+  preso.targetX = mejor.col * TILE + TILE / 2;
+  preso.targetY = mejor.row * TILE + TILE / 2;
+  preso.objetivo = "escapar";
+  preso.objetivoTipo = "borde";
+  return true;
+}
+
+function registrarFuga(preso) {
+  const idx = npcs.indexOf(preso);
+  if (idx >= 0) npcs.splice(idx, 1);
+  if (preso.celdaAsignada) {
+    grid[preso.celdaAsignada.row][preso.celdaAsignada.col].asignada = false;
+    gridDirty = true;
+  }
+  estadoGlobal.fugas++;
+  if (estadoGlobal.fugas >= FUGAS_MAX && !estadoGlobal.finDePartida) {
+    finalizarPartida("derrota", "Demasiadas fugas: " + estadoGlobal.fugas);
+  }
+}
+
+/* =========================================================
+   TICK DE PRESO
+   ========================================================= */
+function tickPreso(preso) {
+  if (preso.huyendo) {
+    if (enDestino(preso)) registrarFuga(preso);
+    return;
+  }
+
+  if (preso.celdaAsignada) {
+    const c = preso.celdaAsignada.col;
+    const r = preso.celdaAsignada.row;
+    if (grid[r][c].tipo !== "celda") {
+      preso.celdaAsignada = null;
+      preso.recienLlegado = false;
+      preso.objetivo = null;
+      preso.objetivoTipo = null;
+    }
+  }
+
+  if (preso.recienLlegado && preso.celdaAsignada) {
+    if (enDestino(preso)) resolverLlegada(preso);
+    return;
+  }
+
+  preso.hambre   = Math.max(0, preso.hambre   - 2);
+  preso.higiene  = Math.max(0, preso.higiene  - 1);
+  preso.libertad = Math.max(0, preso.libertad - 0.5);
+
+  if (preso.libertad <= 0) preso.estado = "motin";
+  else if (preso.libertad < 20) preso.estado = "inquieto";
+  else preso.estado = "normal";
+
+  if (preso.estado === "inquieto" || preso.estado === "motin") {
+    preso.speed = preso.speedBase * SPEED_INQUIETO;
+  } else {
+    preso.speed = preso.speedBase;
+  }
+
+  if (puedeHuir(preso) && Math.random() < 0.15) {
+    iniciarHuida(preso);
+    return;
+  }
+
+  if (preso.estado === "motin") {
+    if (enDestino(preso) || preso.objetivo === null) {
+      if (!asignarTargetAleatorioDeTipo(preso, "patio", "patio")) {
+        asignarTargetAleatorioDeTipo(preso, "vacio", "patio");
+      }
+    }
+    return;
+  }
+
+  if (preso.objetivo && enDestino(preso)) resolverLlegada(preso);
+
+  // v11: cooldown tras llegar para no reasignar el mismo tipo inmediatamente
+  if (preso.cooldownLlegada > 0) {
+    preso.cooldownLlegada--;
+    return;
+  }
+
+  if (!preso.objetivo) {
+    if (preso.hambre < 30) {
+      if (!asignarTargetATipo(preso, "comedor", "comedor")) {
+        if (!asignarTargetAleatorioDeTipo(preso, "vacio", "patio")) {
+          // Si no hay nada, wander pequeño
+          preso.targetX = preso.x + (Math.random() - 0.5) * 60;
+          preso.targetY = preso.y + (Math.random() - 0.5) * 60;
+          preso.objetivo = "wander";
+        }
+      }
+    } else if (preso.higiene < 30) {
+      if (!asignarTargetATipo(preso, "ducha", "ducha")) {
+        if (!asignarTargetAleatorioDeTipo(preso, "vacio", "patio")) {
+          preso.targetX = preso.x + (Math.random() - 0.5) * 60;
+          preso.targetY = preso.y + (Math.random() - 0.5) * 60;
+          preso.objetivo = "wander";
+        }
+      }
+    } else {
+      if (!asignarTargetAleatorioDeTipo(preso, "patio", "patio")) {
+        if (!asignarTargetAleatorioDeTipo(preso, "vacio", "patio")) {
+          preso.targetX = preso.x + (Math.random() - 0.5) * 60;
+          preso.targetY = preso.y + (Math.random() - 0.5) * 60;
+          preso.objetivo = "wander";
+        }
+      }
+    }
+  }
+}
+
+/* =========================================================
+   GUARDIAS
+   ========================================================= */
+const DIST_DETECTAR_MOTIN = 100;
+const DIST_CALMAR        = 20;
+
+function presoEnMotinMasCercano(guardia) {
+  let mejor = null, mejorDist = Infinity;
+  const gx = guardia.x, gy = guardia.y;
+  for (let i = 0; i < presosEnMotin.length; i++) {
+    const n = presosEnMotin[i];
+    const dx = n.x - gx, dy = n.y - gy;
+    const d = Math.sqrt(dx*dx + dy*dy);
+    if (d < mejorDist) { mejorDist = d; mejor = n; }
+  }
+  return mejor;
+}
+
+function presoHuyendoMasCercano(guardia) {
+  let mejor = null, mejorDist = Infinity;
+  const gx = guardia.x, gy = guardia.y;
+  for (let i = 0; i < npcs.length; i++) {
+    const n = npcs[i];
+    if (n.tipo !== "preso" || !n.huyendo) continue;
+    const dx = n.x - gx, dy = n.y - gy;
+    const d = Math.sqrt(dx*dx + dy*dy);
+    if (d < mejorDist) { mejorDist = d; mejor = n; }
+  }
+  return mejor;
+}
+
+function patrullar(guardia) {
+  for (let i = 0; i < 50; i++) {
+    const col = Math.floor(Math.random() * COLS);
+    const row = Math.floor(Math.random() * ROWS);
+    if (celdaEsTransitable(col, row)) {
+      guardia.targetX = col * TILE + TILE / 2;
+      guardia.targetY = row * TILE + TILE / 2;
+      guardia.objetivo = "patrulla";
+      return;
+    }
+  }
+}
+
+function tickGuardia(guardia) {
+  guardia.detectoMotin = false;
+
+  const huidizo = presoHuyendoMasCercano(guardia);
+  if (huidizo) {
+    const dx = huidizo.x - guardia.x, dy = huidizo.y - guardia.y;
+    const d = Math.sqrt(dx*dx + dy*dy);
+    if (d < DIST_DETECTAR_MOTIN) {
+      guardia.objetivo = "perseguir";
+      guardia.presoObjetivo = huidizo;
+      guardia.targetX = huidizo.x;
+      guardia.targetY = huidizo.y;
+      if (d < DIST_CALMAR) {
+        huidizo.huyendo = false;
+        huidizo.estado = "normal";
+        huidizo.libertad = 50;
+        huidizo.speed = huidizo.speedBase;
+        huidizo.objetivo = null;
+        huidizo.objetivoTipo = null;
+        huidizo.targetX = huidizo.x;
+        huidizo.targetY = huidizo.y;
+        guardia.objetivo = "patrulla";
+        guardia.presoObjetivo = null;
+      }
+      return;
+    }
+  }
+
+  const motin = presoEnMotinMasCercano(guardia);
+  if (motin) {
+    const dx = motin.x - guardia.x, dy = motin.y - guardia.y;
+    const d = Math.sqrt(dx*dx + dy*dy);
+    if (d < DIST_DETECTAR_MOTIN) {
+      guardia.detectoMotin = true;
+      guardia.objetivo = "perseguir";
+      guardia.presoObjetivo = motin;
+      guardia.targetX = motin.x;
+      guardia.targetY = motin.y;
+      if (d < DIST_CALMAR) {
+        motin.estado = "normal";
+        motin.libertad = 50;
+        motin.speed = motin.speedBase;
+        motin.objetivo = null;
+        motin.objetivoTipo = null;
+        motin.targetX = motin.x;
+        motin.targetY = motin.y;
+        guardia.objetivo = "patrulla";
+        guardia.presoObjetivo = null;
+      }
+      return;
+    }
+  }
+
+  if (guardia.objetivo !== "patrulla" || enDestino(guardia)) {
+    guardia.presoObjetivo = null;
+    patrullar(guardia);
+  }
+}
+
+/* =========================================================
+   OBREROS
+   ========================================================= */
+function tickObrero(obrero) {
+  if (obrero.objetivo !== "patrulla" || enDestino(obrero)) {
+    for (let i = 0; i < 50; i++) {
+      const col = Math.floor(Math.random() * COLS);
+      const row = Math.floor(Math.random() * ROWS);
+      if (celdaEsTransitable(col, row)) {
+        obrero.targetX = col * TILE + TILE / 2;
+        obrero.targetY = row * TILE + TILE / 2;
+        obrero.objetivo = "patrulla";
+        break;
+      }
+    }
+  }
+}
+
+/* =========================================================
+   DIBUJO DE NPCs
+   ========================================================= */
+const cacheRgba = new Map();
+
+function hexToRgba(hex, alpha) {
+  const clave = hex + "_" + alpha;
+  let val = cacheRgba.get(clave);
+  if (val !== undefined) return val;
+  if (cacheRgba.size >= 64) cacheRgba.clear();
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  val = "rgba(" + r + "," + g + "," + b + "," + alpha + ")";
+  cacheRgba.set(clave, val);
+  return val;
+}
+
+function dibujarNPC(npc, offsetX, offsetY, tiempoMs) {
+  const sx = npc.x + offsetX;
+  const sy = npc.y + offsetY;
+
+  ctx.beginPath();
+  ctx.ellipse(sx, sy + NPC_RADIUS * 0.9, NPC_RADIUS * 1.2, NPC_RADIUS * 0.5, 0, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(0,0,0,0.2)";
+  ctx.fill();
+
+  let colorCono = npc.color;
+  if (npc.tipo === "preso") {
+    if (npc.huyendo) colorCono = "#ffff00";
+    else if (npc.estado === "inquieto") colorCono = "#ff8800";
+    else if (npc.estado === "motin") colorCono = "#ff0000";
+  } else if (npc.tipo === "guardia" && npc.detectoMotin) {
+    colorCono = "#ff6666";
+  }
+
+  const a1 = npc.angle - VISION_FOV / 2;
+  const a2 = npc.angle + VISION_FOV / 2;
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(sx + Math.cos(a1) * VISION_RADIUS, sy + Math.sin(a1) * VISION_RADIUS);
+  ctx.lineTo(sx + Math.cos(a2) * VISION_RADIUS, sy + Math.sin(a2) * VISION_RADIUS);
+  ctx.closePath();
+  ctx.fillStyle = hexToRgba(colorCono, VISION_ALPHA);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(sx, sy, NPC_RADIUS, 0, Math.PI * 2);
+
+  if (npc.tipo === "preso" && npc.huyendo) {
+    const pulso = 0.5 + 0.5 * Math.sin(tiempoMs * 0.012);
+    ctx.fillStyle = "rgb(255," + Math.floor(200 + 55 * pulso) + ",0)";
+  } else if (npc.tipo === "preso" && npc.estado === "motin") {
+    const pulso = 0.5 + 0.5 * Math.sin(tiempoMs * 0.008);
+    ctx.fillStyle = "rgb(255," + Math.floor(60 + 120 * pulso) + "," + Math.floor(60 + 40 * pulso) + ")";
+  } else {
+    ctx.fillStyle = npc.color;
+  }
+  ctx.fill();
+
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#ffffff";
+  ctx.stroke();
+}
+
+/* =========================================================
+   POBLAR
+   ========================================================= */
+function posAleatoriaTransitable() {
+  const tiposTransitables = ["vacio", "celda", "comedor", "ducha", "patio"];
+  const candidatos = [];
+  for (let t = 0; t < tiposTransitables.length; t++) {
+    const arr = indiceCeldasPorTipo.get(tiposTransitables[t]);
+    if (arr) for (let i = 0; i < arr.length; i++) candidatos.push(arr[i]);
+  }
+  if (candidatos.length > 0) {
+    const d = candidatos[Math.floor(Math.random() * candidatos.length)];
+    return { x: d.col * TILE + TILE / 2, y: d.row * TILE + TILE / 2 };
+  }
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (grid[r][c].tipo !== "muro") {
+        return { x: c * TILE + TILE / 2, y: r * TILE + TILE / 2 };
+      }
+    }
+  }
+  return { x: TILE / 2, y: TILE / 2 };
+}
+
+function poblarMundo() {
+  for (let i = 0; i < 5; i++) spawnearPreso();
+  for (let i = 0; i < 2; i++) {
+    const p = posAleatoriaTransitable();
+    npcs.push(crearGuardia(p.x, p.y));
+  }
+  const p = posAleatoriaTransitable();
+  npcs.push(crearObrero(p.x, p.y));
+}
+
+/* =========================================================
+   MOVIMIENTO
+   ========================================================= */
+function lerpAngle(a, b, t) {
+  let diff = ((b - a + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  return a + diff * t;
+}
+
+function actualizarMovimiento(npc, dt) {
+  const dx = npc.targetX - npc.x;
+  const dy = npc.targetY - npc.y;
+  const dist = Math.sqrt(dx*dx + dy*dy);
+  if (dist < 2) return;
+
+  const dirDeseada = Math.atan2(dy, dx);
+  const t = Math.min(1, dt * 8);
+  npc.angle = lerpAngle(npc.angle, dirDeseada, t);
+
+  const step = npc.speed * dt;
+  const nx = npc.x + Math.cos(dirDeseada) * Math.min(step, dist);
+  const ny = npc.y + Math.sin(dirDeseada) * Math.min(step, dist);
+  if (puntoEnMuro(nx, ny)) return;
+  npc.x = nx;
+  npc.y = ny;
+}
+
+/* =========================================================
+   ECONOMÍA
+   ========================================================= */
+const INGRESO_POR_PRESO = 20;
+const GASTO_POR_GUARDIA = 15;
+const GASTO_POR_OBRERO  = 10;
+
+function contarTipo(tipo) {
+  let n = 0;
+  for (let i = 0; i < npcs.length; i++) if (npcs[i].tipo === tipo) n++;
+  return n;
+}
+
+function celdasLibresDeCelda() {
+  const arr = indiceCeldasPorTipo.get("celda");
+  const total = arr ? arr.length : 0;
+  const ocupadas = contarTipo("preso");
+  return Math.max(0, total - ocupadas);
+}
+
+function cerrarDia() {
+  if (estadoGlobal.dia === estadoGlobal.ultimoDiaCerrado) return;
+  const presos   = contarTipo("preso");
+  const guardias = contarTipo("guardia");
+  const obreros  = contarTipo("obrero");
+  estadoGlobal.dinero += presos * INGRESO_POR_PRESO;
+  estadoGlobal.dinero -= guardias * GASTO_POR_GUARDIA + obreros * GASTO_POR_OBRERO;
+  if (estadoGlobal.dinero < 0) {
+    estadoGlobal.dinero = 0;
+    finalizarPartida("derrota", "Te quedaste sin dinero");
+    estadoGlobal.ultimoDiaCerrado = estadoGlobal.dia;
+    return;
+  }
+  estadoGlobal.dia++;
+  estadoGlobal.tickDelDia = 0;
+  if (estadoGlobal.dia <= DIA_VICTORIA && celdasLibresDeCelda() > 0) spawnearPreso();
+  if (estadoGlobal.dia > DIA_VICTORIA) {
+    const presosFinal = contarTipo("preso");
+    if (presosFinal >= PRESOS_PARA_GANAR) finalizarPartida("victoria", "¡Has construido una prisión exitosa!");
+    else if (presosFinal < PRESOS_MINIMOS) finalizarPartida("derrota", "Muy pocos presos al final del día " + DIA_VICTORIA);
+    else finalizarPartida("derrota", "No llegaste a " + PRESOS_PARA_GANAR + " presos");
+  }
+  estadoGlobal.ultimoDiaCerrado = estadoGlobal.dia - 1;
+}
+
+function finalizarPartida(resultado, motivo) {
+  if (estadoGlobal.finDePartida) return;
+  estadoGlobal.finDePartida = true;
+  estadoGlobal.pausado = true;
+  estadoGlobal.resultado = resultado;
+  estadoGlobal.motivoFin = motivo;
+}
+
+function comprobarMotines() {
+  let motines = 0;
+  for (let i = 0; i < npcs.length; i++) {
+    const n = npcs[i];
+    if (n.tipo === "preso" && n.estado === "motin") motines++;
+  }
+  estadoGlobal.motinesActuales = motines;
+  if (motines >= MOTINES_MAX && !estadoGlobal.finDePartida) {
+    finalizarPartida("derrota", "Motín general: " + motines + " presos en motín");
+  }
+}
+
+/* =========================================================
+   REINICIO
+   ========================================================= */
+function reiniciarPartida() {
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      grid[r][c].tipo = "vacio";
+      grid[r][c].asignada = false;
+    }
+  }
+  gridDirty = true;
+  reconstruirIndiceCeldas();
+  npcs.length = 0;
+  presosEnMotin.length = 0;
+  nextNPCId = 1;
+  estadoGlobal.dinero = 1000;
+  estadoGlobal.dia = 1;
+  estadoGlobal.tickDelDia = 0;
+  estadoGlobal.pausado = false;
+  estadoGlobal.resultado = null;
+  estadoGlobal.finDePartida = false;
+  estadoGlobal.motivoFin = "";
+  estadoGlobal.motinesActuales = 0;
+  estadoGlobal.ultimoDiaCerrado = 0;
+  estadoGlobal.fugas = 0;
+  poblarMundo();
+  lastTick = performance.now();
+  lastFrameTime = performance.now();
+}
+
+/* =========================================================
+   TICK
+   ========================================================= */
+let lastTick = performance.now();
+
+function tick() {
+  if (!puedeSimular()) return;
+  estadoGlobal.tickDelDia++;
+  if (estadoGlobal.tickDelDia >= TICKS_POR_DIA) {
+    cerrarDia();
+    if (estadoGlobal.finDePartida) return;
+  }
+  presosEnMotin.length = 0;
+  for (let i = 0; i < npcs.length; i++) {
+    const n = npcs[i];
+    if (n.tipo === "preso" && n.estado === "motin") presosEnMotin.push(n);
+  }
+  const snapshot = npcs.slice();
+  for (let i = 0; i < snapshot.length; i++) {
+    const npc = snapshot[i];
+    if (npc.tipo === "preso") tickPreso(npc);
+    else if (npc.tipo === "guardia") tickGuardia(npc);
+    else if (npc.tipo === "obrero") tickObrero(npc);
+  }
+  comprobarMotines();
+}
+
+/* =========================================================
+   FPS
+   ========================================================= */
+let fpsAccum = 0, fpsFrames = 0, fpsValue = 0;
+
+/* =========================================================
+   HORA Y FASE
+   ========================================================= */
+function faseDelDia() {
+  if (TICKS_POR_DIA <= 0) return { nombre: "Noche", tinte: "rgba(10,10,40,0.22)" };
+  const p = estadoGlobal.tickDelDia / TICKS_POR_DIA;
+  let a, b, t;
+  if (p < 0.25)      { a = FASE_AMANECER; b = FASE_MEDIODIA; t = p / 0.25; }
+  else if (p < 0.5)  { a = FASE_MEDIODIA; b = FASE_TARDE;    t = (p - 0.25) / 0.25; }
+  else if (p < 0.75) { a = FASE_TARDE;    b = FASE_NOCHE;    t = (p - 0.5) / 0.25; }
+  else               { a = FASE_NOCHE;    b = FASE_AMANECER; t = (p - 0.75) / 0.25; }
+  const r = Math.round(a.r + (b.r - a.r) * t);
+  const g = Math.round(a.g + (b.g - a.g) * t);
+  const bl = Math.round(a.b + (b.b - a.b) * t);
+  const alpha = a.a + (b.a - a.a) * t;
+  let nombre;
+  if (p < 0.20) nombre = "Amanecer";
+  else if (p < 0.45) nombre = "Mediodía";
+  else if (p < 0.70) nombre = "Atardecer";
+  else nombre = "Noche";
+  return { nombre, tinte: "rgba(" + r + "," + g + "," + bl + "," + alpha.toFixed(3) + ")" };
+}
+
+function dosDigitos(n) { return n < 10 ? "0" + n : "" + n; }
+
+function horaDelDia() {
+  if (TICKS_POR_DIA <= 0) return "00:00";
+  const minutos = Math.floor((estadoGlobal.tickDelDia / TICKS_POR_DIA) * MINUTOS_POR_DIA);
+  const hh = Math.floor(minutos / 60) % 24;
+  const mm = minutos % 60;
+  return dosDigitos(hh) + ":" + dosDigitos(mm);
+}
+
+/* =========================================================
+   HUD
+   ========================================================= */
+let ultimoTxtFPS = "";
+let ultimoEstadoFPS = "";
+let ultimoTxtBarra = "";
+let ultimoColorBarra = "";
+let ultimoTxtTipo = "";
+let ultimoRepintadoForzado = 0;
+
+function drawFPS(ahoraMs) {
+  ctx.font = "14px monospace";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#e0e0e0";
+  const txt = "FPS: " + fpsValue;
+  if (txt !== ultimoTxtFPS || ahoraMs - ultimoRepintadoForzado > 250) {
+    ctx.fillText(txt, 10, 10);
+    ultimoTxtFPS = txt;
+  }
+  let est = "En marcha";
+  if (estadoGlobal.finDePartida) est = "FIN";
+  else if (estadoGlobal.pausado) est = "PAUSA (espacio)";
+  if (est !== ultimoEstadoFPS || ahoraMs - ultimoRepintadoForzado > 250) {
+    ctx.fillText(est, 10, 28);
+    ultimoEstadoFPS = est;
+  }
+}
+
+function drawBarraEstado(ahoraMs) {
+  let presos = 0, motines = 0;
+  for (let i = 0; i < npcs.length; i++) {
+    const n = npcs[i];
+    if (n.tipo === "preso") { presos++; if (n.estado === "motin") motines++; }
+  }
+  const fase = faseDelDia();
+  const txt = "Día " + estadoGlobal.dia + " · " + horaDelDia() + " (" + fase.nombre + ")" +
+              "   Presos: " + presos + "   Motines: " + motines + "/" + MOTINES_MAX +
+              "   Fugas: " + estadoGlobal.fugas + "/" + FUGAS_MAX +
+              "   Dinero: $" + estadoGlobal.dinero;
+  ctx.font = "14px monospace";
+  ctx.textBaseline = "top";
+  const pad = 8;
+  const w = ctx.measureText(txt).width + pad * 2;
+  const h = 22;
+  const x = Math.floor((window.innerWidth - w) / 2);
+  const y = 10;
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.fillRect(x, y, w, h);
+  let color = "#e0e0e0";
+  if (motines > 0) color = "#ff6666";
+  if (estadoGlobal.dinero < 100) color = "#ffaa44";
+  if (estadoGlobal.fugas > 0) color = "#ffff00";
+  if (txt !== ultimoTxtBarra || color !== ultimoColorBarra ||
+      ahoraMs - ultimoRepintadoForzado > 250) {
+    ctx.fillStyle = color;
+    ctx.fillText(txt, x + pad, y + 4);
+    ultimoTxtBarra = txt;
+    ultimoColorBarra = color;
+  }
+}
+
+function drawTipoSeleccionado(ahoraMs) {
+  const txt = "Tipo: " + tipoSeleccionado + " ($" + TIPOS_CELDA[tipoSeleccionado].coste + ")";
+  ctx.font = "14px monospace";
+  ctx.textBaseline = "top";
+  const pad = 6;
+  const w = ctx.measureText(txt).width + pad * 2;
+  const h = 20;
+  const x = window.innerWidth - w - 10;
+  const y = 10;
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillRect(x, y, w, h);
+  const col = TIPOS_CELDA[tipoSeleccionado].color;
+  if (col) { ctx.fillStyle = col; ctx.fillRect(x + 3, y + 4, 12, h - 8); }
+  ctx.fillStyle = "#e0e0e0";
+  if (txt !== ultimoTxtTipo || ahoraMs - ultimoRepintadoForzado > 250) {
+    ctx.fillText(txt, x + (col ? 20 : pad), y + 3);
+    ultimoTxtTipo = txt;
+  }
+}
+
+/* =========================================================
+   v11: MENÚ DE CONTROLES + GUÍA DE COLORES
+   ========================================================= */
+const CONTROLES = [
+  ["1-6", "Elegir tipo de celda"],
+  ["Clic izq.", "Pintar / arrastrar"],
+  ["Espacio", "Pausa / reanudar"],
+  ["R", "Reiniciar (fin de partida)"]
+];
+
+const GUIA_CELDAS = [
+  ["Muro",    TIPOS_CELDA.muro.color,    "bloquea paso"],
+  ["Celda",   TIPOS_CELDA.celda.color,   "asigna preso"],
+  ["Comedor", TIPOS_CELDA.comedor.color, "hambre"],
+  ["Ducha",   TIPOS_CELDA.ducha.color,   "higiene"],
+  ["Patio",   TIPOS_CELDA.patio.color,   "ocio"]
+];
+
+const GUIA_NPCS = [
+  ["Preso",   NPC_COLORS.preso,   "normal"],
+  ["Guardia", NPC_COLORS.guardia, "calma"],
+  ["Obrero",  NPC_COLORS.obrero,  "ronda"]
+];
+
+const GUIA_ESTADOS = [
+  ["Inquieto", "#ff8800", "libertad < 20"],
+  ["Motín",    "#ff0000", "libertad = 0"],
+  ["Huyendo",  "#ffff00", "escape"]
+];
+
+function drawMenuControles() {
+  const pad = 10;
+  const lineH = 16;
+  const seccionH = 6;
+  const font = "11px monospace";
+  ctx.font = font;
+  ctx.textBaseline = "top";
+
+  // Calcular ancho máximo de todas las filas
+  let maxW = ctx.measureText("GUÍA DE COLORES").width;
+  const filas = [];
+  filas.push({ tipo: "titulo", txt: "CONTROLES" });
+  for (let i = 0; i < CONTROLES.length; i++) {
+    const t = CONTROLES[i][0] + "  " + CONTROLES[i][1];
+    if (ctx.measureText(t).width > maxW) maxW = ctx.measureText(t).width;
+    filas.push({ tipo: "control", key: CONTROLES[i][0], val: CONTROLES[i][1] });
+  }
+  filas.push({ tipo: "espacio" });
+  filas.push({ tipo: "titulo", txt: "GUÍA DE COLORES" });
+  filas.push({ tipo: "subtitulo", txt: "Celdas" });
+  for (let i = 0; i < GUIA_CELDAS.length; i++) {
+    const t = GUIA_CELDAS[i][0] + "  " + GUIA_CELDAS[i][2];
+    if (ctx.measureText(t).width + 20 > maxW) maxW = ctx.measureText(t).width + 20;
+    filas.push({ tipo: "color", nombre: GUIA_CELDAS[i][0], color: GUIA_CELDAS[i][1], desc: GUIA_CELDAS[i][2] });
+  }
+  filas.push({ tipo: "subtitulo", txt: "NPCs" });
+  for (let i = 0; i < GUIA_NPCS.length; i++) {
+    const t = GUIA_NPCS[i][0] + "  " + GUIA_NPCS[i][2];
+    if (ctx.measureText(t).width + 20 > maxW) maxW = ctx.measureText(t).width + 20;
+    filas.push({ tipo: "color", nombre: GUIA_NPCS[i][0], color: GUIA_NPCS[i][1], desc: GUIA_NPCS[i][2] });
+  }
+  filas.push({ tipo: "subtitulo", txt: "Estados" });
+  for (let i = 0; i < GUIA_ESTADOS.length; i++) {
+    const t = GUIA_ESTADOS[i][0] + "  " + GUIA_ESTADOS[i][2];
+    if (ctx.measureText(t).width + 20 > maxW) maxW = ctx.measureText(t).width + 20;
+    filas.push({ tipo: "color", nombre: GUIA_ESTADOS[i][0], color: GUIA_ESTADOS[i][1], desc: GUIA_ESTADOS[i][2] });
+  }
+
+  const panelW = maxW + pad * 2;
+  const panelH = pad * 2 + filas.length * lineH + 20;
+
+  const x = window.innerWidth - panelW - 12;
+  const y = window.innerHeight - panelH - 12;
+
+  // Fondo
+  ctx.fillStyle = "rgba(0,0,0,0.72)";
+  ctx.fillRect(x, y, panelW, panelH);
+  ctx.strokeStyle = "rgba(255,255,255,0.15)";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, panelW, panelH);
+
+  // Renderizar filas
+  let cy = y + pad;
+  for (let i = 0; i < filas.length; i++) {
+    const f = filas[i];
+    if (f.tipo === "titulo") {
+      ctx.fillStyle = "#ffcc44";
+      ctx.font = "bold " + font;
+      ctx.fillText(f.txt, x + pad, cy);
+      cy += lineH + 4;
+    } else if (f.tipo === "subtitulo") {
+      ctx.fillStyle = "#aaa";
+      ctx.font = font;
+      ctx.fillText(f.txt, x + pad, cy);
+      cy += lineH;
+    } else if (f.tipo === "control") {
+      ctx.fillStyle = "#7dcfff";
+      ctx.font = font;
+      ctx.fillText(f.key, x + pad, cy);
+      ctx.fillStyle = "#e0e0e0";
+      ctx.fillText(f.val, x + pad + 70, cy);
+      cy += lineH;
+    } else if (f.tipo === "color") {
+      // Cuadrado de color
+      ctx.fillStyle = f.color;
+      ctx.fillRect(x + pad, cy + 2, 10, 10);
+      ctx.strokeStyle = "rgba(255,255,255,0.4)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + pad + 0.5, cy + 2.5, 10, 10);
+      // Nombre
+      ctx.fillStyle = "#e0e0e0";
+      ctx.font = font;
+      ctx.fillText(f.nombre, x + pad + 16, cy);
+      // Descripción
+      ctx.fillStyle = "#888";
+      ctx.fillText(f.desc, x + pad + 16 + 70, cy);
+      cy += lineH;
+    } else if (f.tipo === "espacio") {
+      cy += seccionH;
+    }
+  }
+}
+
+/* =========================================================
+   OVERLAYS
+   ========================================================= */
+function drawFinDePartida() {
+  if (!estadoGlobal.finDePartida) return;
+  ctx.fillStyle = "rgba(0,0,0,0.78)";
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+  const esVictoria = estadoGlobal.resultado === "victoria";
+  ctx.fillStyle = esVictoria ? "#66ff88" : "#ff4444";
+  ctx.font = "bold 48px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(esVictoria ? "¡VICTORIA!" : "GAME OVER", window.innerWidth / 2, window.innerHeight / 2 - 40);
+  ctx.fillStyle = "#e0e0e0";
+  ctx.font = "18px monospace";
+  ctx.fillText(estadoGlobal.motivoFin, window.innerWidth / 2, window.innerHeight / 2 + 10);
+  ctx.font = "16px monospace";
+  ctx.fillStyle = "#aaa";
+  ctx.fillText("Has llegado al Día " + estadoGlobal.dia, window.innerWidth / 2, window.innerHeight / 2 + 45);
+  ctx.fillStyle = "#ffcc44";
+  ctx.font = "bold 20px monospace";
+  ctx.fillText("Pulsa R para reiniciar", window.innerWidth / 2, window.innerHeight / 2 + 90);
+  ctx.textAlign = "start";
+  ctx.textBaseline = "top";
+}
+
+function drawPausaOverlay() {
+  if (!estadoGlobal.pausado || estadoGlobal.finDePartida) return;
+  ctx.fillStyle = "rgba(0,0,0,0.35)";
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+  ctx.fillStyle = "#e0e0e0";
+  ctx.font = "bold 32px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("PAUSA", window.innerWidth / 2, window.innerHeight / 2);
+  ctx.textAlign = "start";
+  ctx.textBaseline = "top";
+}
+
+/* =========================================================
+   DRAW
+   ========================================================= */
+function draw(ahoraMs) {
+  const off = getGridOffset();
+  ctx.fillStyle = COLOR_BG;
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+  if (gridDirty) redibujarGridCache();
+  ctx.drawImage(gridCanvas, off.x, off.y);
+
+  const fase = faseDelDia();
+  ctx.fillStyle = fase.tinte;
+  ctx.fillRect(off.x, off.y, GRID_W, GRID_H);
+
+  for (let i = 0; i < npcs.length; i++) dibujarNPC(npcs[i], off.x, off.y, ahoraMs);
+
+  drawPausaOverlay();
+  drawFinDePartida();
+
+  drawFPS(ahoraMs);
+  drawBarraEstado(ahoraMs);
+  drawTipoSeleccionado(ahoraMs);
+  drawMenuControles();
+
+  if (ahoraMs - ultimoRepintadoForzado > 250) ultimoRepintadoForzado = ahoraMs;
+}
+
+/* =========================================================
+   LOOP
+   ========================================================= */
+let lastFrameTime = performance.now();
+
+function loop(now) {
+  const dtMs = now - lastFrameTime;
+  lastFrameTime = now;
+  const dt = Math.min(dtMs / 1000, 0.05);
+
+  let ticksRun = 0;
+  while (now - lastTick >= TICK_MS && ticksRun < 5) {
+    lastTick += TICK_MS;
+    tick();
+    ticksRun++;
+  }
+  if (now - lastTick >= TICK_MS) lastTick = now;
+
+  if (puedeSimular()) {
+    for (let i = 0; i < npcs.length; i++) actualizarMovimiento(npcs[i], dt);
+  }
+
+  fpsAccum += dtMs;
+  fpsFrames++;
+  if (fpsAccum >= 500) {
+    fpsValue = Math.round((fpsFrames * 1000) / fpsAccum);
+    fpsAccum = 0;
+    fpsFrames = 0;
+  }
+
+  draw(now);
+  requestAnimationFrame(loop);
+}
+
+poblarMundo();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

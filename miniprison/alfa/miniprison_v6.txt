@@ -1,0 +1,972 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>MiniPrison — Economía y Tiempo</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #1a1a2e;
+    overflow: hidden;
+    height: 100%;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+"use strict";
+
+/* =========================================================
+   CONFIGURACIÓN GLOBAL
+   ========================================================= */
+const TILE = 40;
+const COLS = 20;
+const ROWS = 15;
+const GRID_W = TILE * COLS;
+const GRID_H = TILE * ROWS;
+
+const COLOR_BG = "#1a1a2e";
+const COLOR_GRID = "rgba(255,255,255,0.08)";
+
+const TICK_MS = 1000;
+
+// 1 tick = 1 minuto de juego. Día de prueba = 60 ticks (1 min real).
+// Cambia a 1440 para el día "real" de 24 min.
+const TICKS_POR_DIA = 60;
+const MINUTOS_POR_DIA = 1440;
+
+// Parámetros de los NPCs
+const NPC_RADIUS = 10;
+const VISION_RADIUS = 80;
+const VISION_FOV = Math.PI / 3;
+const VISION_ALPHA = 0.15;
+
+const NPC_COLORS = {
+  preso:   "#ff4444",
+  guardia: "#4488ff",
+  obrero:  "#ffcc44"
+};
+
+const NPC_SPEEDS = {
+  preso:   60,
+  guardia: 90,
+  obrero:  70
+};
+
+const SPEED_INQUIETO = 1.6;
+
+/* =========================================================
+   TIPOS DE CELDA, COLORES Y COSTES
+   ========================================================= */
+const TIPOS_CELDA = {
+  vacio:   { color: null,      coste: 0  },
+  muro:    { color: "#555555", coste: 10 },
+  celda:   { color: "#333355", coste: 50 },
+  comedor: { color: "#335533", coste: 30 },
+  ducha:   { color: "#334455", coste: 30 },
+  patio:   { color: "#555533", coste: 20 }
+};
+
+const TECLAS_TIPO = ["vacio", "muro", "celda", "comedor", "ducha", "patio"];
+
+/* =========================================================
+   CANVAS A PANTALLA COMPLETA (con soporte HiDPI)
+   ========================================================= */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = Math.floor(window.innerWidth  * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+  canvas.style.width  = window.innerWidth  + "px";
+  canvas.style.height = window.innerHeight + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+/* =========================================================
+   INPUT DE TECLADO
+   ========================================================= */
+const keys = Object.create(null);
+
+window.addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  if (e.key === " " || e.key.startsWith("Arrow")) e.preventDefault();
+
+  if (k >= "1" && k <= "6") {
+    const idx = parseInt(k, 10) - 1;
+    tipoSeleccionado = TECLAS_TIPO[idx];
+  }
+
+  // Pausa con espacio (toggle al pulsar, no al mantener)
+  if (k === " " && !e.repeat && !estadoGlobal.gameOver) {
+    estadoGlobal.pausado = !estadoGlobal.pausado;
+  }
+});
+window.addEventListener("keyup", (e) => {
+  keys[e.key.toLowerCase()] = false;
+});
+window.addEventListener("blur", () => {
+  for (const k in keys) keys[k] = false;
+});
+
+/* =========================================================
+   INPUT DE RATÓN (construcción por arrastre)
+   ========================================================= */
+let tipoSeleccionado = "muro";
+let mouseDown = false;
+let lastPaintCol = -1;
+let lastPaintRow = -1;
+
+function pantallaACelda(px, py) {
+  const off = getGridOffset();
+  const gx = px - off.x;
+  const gy = py - off.y;
+  if (gx < 0 || gy < 0 || gx >= GRID_W || gy >= GRID_H) return null;
+  return {
+    col: Math.floor(gx / TILE),
+    row: Math.floor(gy / TILE)
+  };
+}
+
+/** Pinta una celda aplicando coste. Devuelve true si se pintó. */
+function pintarCelda(col, row, tipo) {
+  if (col < 0 || row < 0 || col >= COLS || row >= ROWS) return false;
+  if (estadoGlobal.gameOver) return false;
+
+  const celda = grid[row][col];
+  if (celda.tipo === tipo) return false; // sin cambios reales
+
+  const coste = TIPOS_CELDA[tipo].coste;
+  if (estadoGlobal.dinero < coste) {
+    // Sin dinero suficiente: no pintamos
+    return false;
+  }
+
+  estadoGlobal.dinero -= coste;
+  celda.tipo = tipo;
+  gridDirty = true;
+  return true;
+}
+
+canvas.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  if (estadoGlobal.gameOver) return;
+  const celda = pantallaACelda(e.clientX, e.clientY);
+  if (!celda) return;
+  mouseDown = true;
+  pintarCelda(celda.col, celda.row, tipoSeleccionado);
+  lastPaintCol = celda.col;
+  lastPaintRow = celda.row;
+});
+
+canvas.addEventListener("mousemove", (e) => {
+  if (!mouseDown) return;
+  const celda = pantallaACelda(e.clientX, e.clientY);
+  if (!celda) return;
+  pintarLinea(lastPaintCol, lastPaintRow, celda.col, celda.row);
+  lastPaintCol = celda.col;
+  lastPaintRow = celda.row;
+});
+
+window.addEventListener("mouseup", () => {
+  mouseDown = false;
+  lastPaintCol = -1;
+  lastPaintRow = -1;
+});
+
+function pintarLinea(c0, r0, c1, r1) {
+  if (c0 < 0 || r0 < 0) {
+    pintarCelda(c1, r1, tipoSeleccionado);
+    return;
+  }
+  let dc = Math.abs(c1 - c0);
+  let dr = Math.abs(r1 - r0);
+  let sc = c0 < c1 ? 1 : -1;
+  let sr = r0 < r1 ? 1 : -1;
+  let err = dc - dr;
+  let c = c0, r = r0;
+  while (true) {
+    pintarCelda(c, r, tipoSeleccionado);
+    if (c === c1 && r === r1) break;
+    const e2 = 2 * err;
+    if (e2 > -dr) { err -= dr; c += sc; }
+    if (e2 <  dc) { err += dc; r += sr; }
+  }
+}
+
+/* =========================================================
+   OFFSET DEL GRID
+   ========================================================= */
+function getGridOffset() {
+  return {
+    x: Math.floor((window.innerWidth  - GRID_W) / 2),
+    y: Math.floor((window.innerHeight - GRID_H) / 2)
+  };
+}
+
+/* =========================================================
+   GRID DE CONSTRUCCIÓN
+   ========================================================= */
+const grid = [];
+for (let r = 0; r < ROWS; r++) {
+  const fila = [];
+  for (let c = 0; c < COLS; c++) {
+    fila.push({ tipo: "vacio" });
+  }
+  grid.push(fila);
+}
+
+let gridDirty = true;
+
+const gridCanvas = document.createElement("canvas");
+gridCanvas.width  = GRID_W;
+gridCanvas.height = GRID_H;
+const gridCtx = gridCanvas.getContext("2d");
+
+function celdaEsTransitable(col, row) {
+  if (col < 0 || row < 0 || col >= COLS || row >= ROWS) return false;
+  return grid[row][col].tipo !== "muro";
+}
+
+function puntoEnMuro(x, y) {
+  const col = Math.floor(x / TILE);
+  const row = Math.floor(y / TILE);
+  if (col < 0 || row < 0 || col >= COLS || row >= ROWS) return true;
+  return grid[row][col].tipo === "muro";
+}
+
+function redibujarGridCache() {
+  gridCtx.clearRect(0, 0, GRID_W, GRID_H);
+
+  gridCtx.fillStyle = "#151526";
+  gridCtx.fillRect(0, 0, GRID_W, GRID_H);
+
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const tipo = grid[r][c].tipo;
+      const color = TIPOS_CELDA[tipo].color;
+      if (color) {
+        gridCtx.fillStyle = color;
+        gridCtx.fillRect(c * TILE, r * TILE, TILE, TILE);
+      }
+    }
+  }
+
+  gridCtx.strokeStyle = COLOR_GRID;
+  gridCtx.lineWidth = 1;
+  gridCtx.beginPath();
+  for (let x = 0; x <= COLS; x++) {
+    const px = x * TILE + 0.5;
+    gridCtx.moveTo(px, 0);
+    gridCtx.lineTo(px, GRID_H);
+  }
+  for (let y = 0; y <= ROWS; y++) {
+    const py = y * TILE + 0.5;
+    gridCtx.moveTo(0, py);
+    gridCtx.lineTo(GRID_W, py);
+  }
+  gridCtx.stroke();
+
+  gridCtx.strokeStyle = "rgba(255,255,255,0.18)";
+  gridCtx.strokeRect(0.5, 0.5, GRID_W, GRID_H);
+
+  gridDirty = false;
+}
+
+/* =========================================================
+   ESTADO GLOBAL DEL JUEGO
+   ========================================================= */
+const estadoGlobal = {
+  dinero: 1000,
+  dia: 1,
+  tickDelDia: 0,       // 0..TICKS_POR_DIA-1
+  pausado: false,
+  gameOver: false
+};
+
+/* =========================================================
+   SISTEMA DE NPCs
+   ========================================================= */
+let nextNPCId = 1;
+
+function crearPreso(x, y) {
+  return {
+    id: nextNPCId++,
+    tipo: "preso",
+    x, y,
+    angle: Math.random() * Math.PI * 2,
+    speed: NPC_SPEEDS.preso,
+    speedBase: NPC_SPEEDS.preso,
+    targetX: x,
+    targetY: y,
+    color: NPC_COLORS.preso,
+    hambre: 80 + Math.random() * 20,
+    higiene: 80 + Math.random() * 20,
+    libertad: 80 + Math.random() * 20,
+    estado: "normal",
+    objetivo: null
+  };
+}
+
+function crearGuardia(x, y) {
+  return {
+    id: nextNPCId++,
+    tipo: "guardia",
+    x, y,
+    angle: Math.random() * Math.PI * 2,
+    speed: NPC_SPEEDS.guardia,
+    speedBase: NPC_SPEEDS.guardia,
+    targetX: x,
+    targetY: y,
+    color: NPC_COLORS.guardia,
+    objetivo: null,
+    presoObjetivo: null
+  };
+}
+
+function crearObrero(x, y) {
+  return {
+    id: nextNPCId++,
+    tipo: "obrero",
+    x, y,
+    angle: Math.random() * Math.PI * 2,
+    speed: NPC_SPEEDS.obrero,
+    speedBase: NPC_SPEEDS.obrero,
+    targetX: x,
+    targetY: y,
+    color: NPC_COLORS.obrero,
+    objetivo: null
+  };
+}
+
+/* =========================================================
+   BFS SIMPLE SOBRE EL GRID
+   ========================================================= */
+function bfsCeldaMasCercana(startCol, startRow, tipoBuscado) {
+  if (startCol < 0 || startRow < 0 || startCol >= COLS || startRow >= ROWS) {
+    return null;
+  }
+  const visitado = new Uint8Array(COLS * ROWS);
+  const cola = [{ col: startCol, row: startRow }];
+  visitado[startRow * COLS + startCol] = 1;
+
+  const dirs = [[0,-1],[0,1],[-1,0],[1,0]];
+
+  while (cola.length > 0) {
+    const { col, row } = cola.shift();
+
+    if (grid[row][col].tipo === tipoBuscado) {
+      return { col, row };
+    }
+
+    for (const [dc, dr] of dirs) {
+      const nc = col + dc;
+      const nr = row + dr;
+      if (nc < 0 || nr < 0 || nc >= COLS || nr >= ROWS) continue;
+      const idx = nr * COLS + nc;
+      if (visitado[idx]) continue;
+      if (grid[nr][nc].tipo === "muro") continue;
+      visitado[idx] = 1;
+      cola.push({ col: nc, row: nr });
+    }
+  }
+  return null;
+}
+
+function celdaDePunto(x, y) {
+  return {
+    col: Math.max(0, Math.min(COLS - 1, Math.floor(x / TILE))),
+    row: Math.max(0, Math.min(ROWS - 1, Math.floor(y / TILE)))
+  };
+}
+
+/* =========================================================
+   LÓGICA DE NECESIDADES
+   ========================================================= */
+function asignarTargetATipo(npc, tipoCelda, motivo) {
+  const { col, row } = celdaDePunto(npc.x, npc.y);
+  const destino = bfsCeldaMasCercana(col, row, tipoCelda);
+  if (destino) {
+    npc.targetX = destino.col * TILE + TILE / 2;
+    npc.targetY = destino.row * TILE + TILE / 2;
+    npc.objetivo = motivo;
+    return true;
+  }
+  return false;
+}
+
+function asignarTargetAleatorioDeTipo(npc, tipoCelda, motivo) {
+  const candidatos = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (grid[r][c].tipo === tipoCelda) candidatos.push({ col: c, row: r });
+    }
+  }
+  if (candidatos.length === 0) return false;
+  const dest = candidatos[Math.floor(Math.random() * candidatos.length)];
+  npc.targetX = dest.col * TILE + TILE / 2;
+  npc.targetY = dest.row * TILE + TILE / 2;
+  npc.objetivo = motivo;
+  return true;
+}
+
+function enDestino(npc) {
+  return Math.hypot(npc.targetX - npc.x, npc.targetY - npc.y) < 4;
+}
+
+function resolverLlegada(npc) {
+  if (npc.tipo !== "preso") return;
+
+  if (npc.objetivo === "comedor") {
+    npc.hambre = 100;
+  } else if (npc.objetivo === "ducha") {
+    npc.higiene = 100;
+  } else if (npc.objetivo === "celda") {
+    npc.libertad = Math.min(100, npc.libertad + 5);
+  }
+
+  npc.objetivo = null;
+  npc.targetX = npc.x;
+  npc.targetY = npc.y;
+}
+
+function tickPreso(preso) {
+  preso.hambre   = Math.max(0, preso.hambre   - 2);
+  preso.higiene  = Math.max(0, preso.higiene  - 1);
+  preso.libertad = Math.max(0, preso.libertad - 0.5);
+
+  if (preso.libertad <= 0) {
+    preso.estado = "motin";
+  } else if (preso.libertad < 20) {
+    preso.estado = "inquieto";
+  } else {
+    preso.estado = "normal";
+  }
+
+  if (preso.estado === "inquieto" || preso.estado === "motin") {
+    preso.speed = preso.speedBase * SPEED_INQUIETO;
+  } else {
+    preso.speed = preso.speedBase;
+  }
+
+  if (preso.estado === "motin") {
+    if (enDestino(preso) || preso.objetivo === null) {
+      if (!asignarTargetAleatorioDeTipo(preso, "patio", "patio")) {
+        asignarTargetAleatorioDeTipo(preso, "vacio", "patio");
+      }
+    }
+    return;
+  }
+
+  if (preso.objetivo && enDestino(preso)) {
+    resolverLlegada(preso);
+  }
+
+  if (!preso.objetivo) {
+    if (preso.hambre < 30) {
+      if (!asignarTargetATipo(preso, "comedor", "comedor")) {
+        asignarTargetAleatorioDeTipo(preso, "vacio", "patio");
+      }
+    } else if (preso.higiene < 30) {
+      if (!asignarTargetATipo(preso, "ducha", "ducha")) {
+        asignarTargetAleatorioDeTipo(preso, "vacio", "patio");
+      }
+    } else {
+      if (!asignarTargetAleatorioDeTipo(preso, "patio", "patio")) {
+        asignarTargetAleatorioDeTipo(preso, "vacio", "patio");
+      }
+    }
+  }
+}
+
+/* =========================================================
+   LÓGICA DE GUARDIAS
+   ========================================================= */
+const DIST_DETECTAR_MOTIN = 100;
+const DIST_CALMAR        = 20;
+
+function presoEnMotinMasCercano(guardia) {
+  let mejor = null;
+  let mejorDist = Infinity;
+  for (const n of npcs) {
+    if (n.tipo !== "preso" || n.estado !== "motin") continue;
+    const d = Math.hypot(n.x - guardia.x, n.y - guardia.y);
+    if (d < mejorDist) {
+      mejorDist = d;
+      mejor = n;
+    }
+  }
+  return mejor;
+}
+
+function patrullar(guardia) {
+  for (let i = 0; i < 50; i++) {
+    const col = Math.floor(Math.random() * COLS);
+    const row = Math.floor(Math.random() * ROWS);
+    if (celdaEsTransitable(col, row)) {
+      guardia.targetX = col * TILE + TILE / 2;
+      guardia.targetY = row * TILE + TILE / 2;
+      guardia.objetivo = "patrulla";
+      return;
+    }
+  }
+}
+
+function tickGuardia(guardia) {
+  const motin = presoEnMotinMasCercano(guardia);
+  if (motin) {
+    const d = Math.hypot(motin.x - guardia.x, motin.y - guardia.y);
+    if (d < DIST_DETECTAR_MOTIN) {
+      guardia.objetivo = "perseguir";
+      guardia.presoObjetivo = motin;
+      guardia.targetX = motin.x;
+      guardia.targetY = motin.y;
+
+      if (d < DIST_CALMAR) {
+        motin.estado = "normal";
+        motin.libertad = 50;
+        motin.speed = motin.speedBase;
+        motin.objetivo = null;
+        motin.targetX = motin.x;
+        motin.targetY = motin.y;
+        guardia.objetivo = "patrulla";
+        guardia.presoObjetivo = null;
+      }
+      return;
+    }
+  }
+
+  if (guardia.objetivo !== "patrulla" || enDestino(guardia)) {
+    guardia.presoObjetivo = null;
+    patrullar(guardia);
+  }
+}
+
+/* =========================================================
+   LÓGICA DE OBREROS
+   ========================================================= */
+function tickObrero(obrero) {
+  // TODO: reparación de muros en el futuro.
+  if (obrero.objetivo !== "patrulla" || enDestino(obrero)) {
+    for (let i = 0; i < 50; i++) {
+      const col = Math.floor(Math.random() * COLS);
+      const row = Math.floor(Math.random() * ROWS);
+      if (celdaEsTransitable(col, row)) {
+        obrero.targetX = col * TILE + TILE / 2;
+        obrero.targetY = row * TILE + TILE / 2;
+        obrero.objetivo = "patrulla";
+        break;
+      }
+    }
+  }
+}
+
+/* =========================================================
+   DIBUJO DE NPCs
+   ========================================================= */
+function hexToRgba(hex, alpha) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function dibujarNPC(ctx, npc, offsetX, offsetY) {
+  const sx = npc.x + offsetX;
+  const sy = npc.y + offsetY;
+
+  let colorCono = npc.color;
+  if (npc.tipo === "preso" && npc.estado === "inquieto") {
+    colorCono = "#ff8800";
+  } else if (npc.tipo === "preso" && npc.estado === "motin") {
+    colorCono = "#ff0000";
+  }
+
+  const a1 = npc.angle - VISION_FOV / 2;
+  const a2 = npc.angle + VISION_FOV / 2;
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(sx + Math.cos(a1) * VISION_RADIUS,
+             sy + Math.sin(a1) * VISION_RADIUS);
+  ctx.lineTo(sx + Math.cos(a2) * VISION_RADIUS,
+             sy + Math.sin(a2) * VISION_RADIUS);
+  ctx.closePath();
+  ctx.fillStyle = hexToRgba(colorCono, VISION_ALPHA);
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.arc(sx, sy, NPC_RADIUS, 0, Math.PI * 2);
+  if (npc.tipo === "preso" && npc.estado === "motin") {
+    const t = performance.now() * 0.008;
+    const brillo = 0.5 + 0.5 * Math.sin(t);
+    const r = 255;
+    const g = Math.floor(60 + 120 * brillo);
+    const b = Math.floor(60 + 40 * brillo);
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+  } else {
+    ctx.fillStyle = npc.color;
+  }
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#ffffff";
+  ctx.stroke();
+}
+
+/* =========================================================
+   POBLAR EL MUNDO
+   ========================================================= */
+const npcs = [];
+
+function posAleatoriaTransitable() {
+  for (let i = 0; i < 50; i++) {
+    const col = Math.floor(Math.random() * COLS);
+    const row = Math.floor(Math.random() * ROWS);
+    if (celdaEsTransitable(col, row)) {
+      return {
+        x: col * TILE + TILE / 2,
+        y: row * TILE + TILE / 2
+      };
+    }
+  }
+  return { x: TILE / 2, y: TILE / 2 };
+}
+
+function poblarMundo() {
+  for (let i = 0; i < 5; i++) {
+    const p = posAleatoriaTransitable();
+    npcs.push(crearPreso(p.x, p.y));
+  }
+  for (let i = 0; i < 2; i++) {
+    const p = posAleatoriaTransitable();
+    npcs.push(crearGuardia(p.x, p.y));
+  }
+  {
+    const p = posAleatoriaTransitable();
+    npcs.push(crearObrero(p.x, p.y));
+  }
+}
+poblarMundo();
+
+/* =========================================================
+   ACTUALIZACIÓN DE MOVIMIENTO
+   ========================================================= */
+function lerpAngle(a, b, t) {
+  let diff = ((b - a + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  return a + diff * t;
+}
+
+function actualizarMovimiento(npc, dt) {
+  const dx = npc.targetX - npc.x;
+  const dy = npc.targetY - npc.y;
+  const dist = Math.hypot(dx, dy);
+
+  if (dist < 2) return;
+
+  const dirDeseada = Math.atan2(dy, dx);
+  const t = Math.min(1, dt * 8);
+  npc.angle = lerpAngle(npc.angle, dirDeseada, t);
+
+  const step = npc.speed * dt;
+  const nx = npc.x + Math.cos(dirDeseada) * Math.min(step, dist);
+  const ny = npc.y + Math.sin(dirDeseada) * Math.min(step, dist);
+
+  if (puntoEnMuro(nx, ny)) return;
+
+  npc.x = nx;
+  npc.y = ny;
+}
+
+/* =========================================================
+   CICLO DE DÍA Y ECONOMÍA
+   ========================================================= */
+const INGRESO_POR_PRESO = 20;
+const GASTO_POR_GUARDIA = 15;
+const GASTO_POR_OBRERO  = 10;
+
+function contarTipo(tipo) {
+  let n = 0;
+  for (const npc of npcs) if (npc.tipo === tipo) n++;
+  return n;
+}
+
+/** Se ejecuta al final de cada día: aplica ingresos/gastos y comprueba game over. */
+function cerrarDia() {
+  const presos   = contarTipo("preso");
+  const guardias = contarTipo("guardia");
+  const obreros  = contarTipo("obrero");
+
+  const ingreso = presos * INGRESO_POR_PRESO;
+  const gasto   = guardias * GASTO_POR_GUARDIA + obreros * GASTO_POR_OBRERO;
+
+  estadoGlobal.dinero += ingreso;
+  estadoGlobal.dinero -= gasto;
+
+  if (estadoGlobal.dinero < 0) {
+    estadoGlobal.dinero = 0;
+    estadoGlobal.gameOver = true;
+    estadoGlobal.pausado = true;
+  }
+
+  // Avanzar al siguiente día
+  estadoGlobal.dia++;
+  estadoGlobal.tickDelDia = 0;
+}
+
+/* =========================================================
+   TICK DE SIMULACIÓN
+   ========================================================= */
+let lastTick = performance.now();
+
+function tick() {
+  // Si está pausado o game over, no simulamos
+  if (estadoGlobal.pausado || estadoGlobal.gameOver) return;
+
+  // Avance del tiempo
+  estadoGlobal.tickDelDia++;
+  if (estadoGlobal.tickDelDia >= TICKS_POR_DIA) {
+    cerrarDia();
+    if (estadoGlobal.gameOver) return;
+  }
+
+  // Lógica de NPCs
+  for (const npc of npcs) {
+    if (npc.tipo === "preso") tickPreso(npc);
+    else if (npc.tipo === "guardia") tickGuardia(npc);
+    else if (npc.tipo === "obrero") tickObrero(npc);
+  }
+}
+
+/* =========================================================
+   FPS
+   ========================================================= */
+let fpsAccum = 0;
+let fpsFrames = 0;
+let fpsValue = 0;
+
+/* =========================================================
+   HORA DEL DÍA (a partir de tickDelDia)
+   ========================================================= */
+/**
+ * Devuelve { nombre, tinte } donde "tinte" es rgba() aplicado al fondo.
+ * Se interpolan 4 fases: amanecer → mediodía → atardecer → noche.
+ */
+function faseDelDia() {
+  const p = estadoGlobal.tickDelDia / TICKS_POR_DIA; // 0..1
+
+  // Colores base de tinte (con alpha bajo, para no tapar el juego)
+  const amanecer = { r: 255, g: 140, b: 60,  a: 0.10 };
+  const mediodia = { r: 255, g: 230, b: 180, a: 0.03 };
+  const tarde    = { r: 255, g: 120, b: 60,  a: 0.09 };
+  const noche    = { r: 10,  g: 10,  b: 40,  a: 0.22 };
+
+  let a, b, t;
+  if (p < 0.25)      { a = amanecer; b = mediodia; t = p / 0.25; }
+  else if (p < 0.5)  { a = mediodia; b = tarde;    t = (p - 0.25) / 0.25; }
+  else if (p < 0.75) { a = tarde;    b = noche;    t = (p - 0.5) / 0.25; }
+  else               { a = noche;    b = amanecer; t = (p - 0.75) / 0.25; }
+
+  const r = Math.round(a.r + (b.r - a.r) * t);
+  const g = Math.round(a.g + (b.g - a.g) * t);
+  const bl = Math.round(a.b + (b.b - a.b) * t);
+  const alpha = a.a + (b.a - a.a) * t;
+
+  // Nombre legible (aprox según fase)
+  let nombre;
+  if (p < 0.20)      nombre = "Amanecer";
+  else if (p < 0.45) nombre = "Mediodía";
+  else if (p < 0.70) nombre = "Atardecer";
+  else               nombre = "Noche";
+
+  return {
+    nombre,
+    tinte: `rgba(${r},${g},${bl},${alpha.toFixed(3)})`
+  };
+}
+
+/** Convierte tickDelDia a hora "HH:MM" usando MINUTOS_POR_DIA. */
+function horaDelDia() {
+  const minutos = Math.floor(
+    (estadoGlobal.tickDelDia / TICKS_POR_DIA) * MINUTOS_POR_DIA
+  );
+  const hh = Math.floor(minutos / 60) % 24;
+  const mm = minutos % 60;
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+}
+
+/* =========================================================
+   DIBUJO GENERAL
+   ========================================================= */
+function drawFPS() {
+  ctx.font = "14px monospace";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#e0e0e0";
+  ctx.fillText(`FPS: ${fpsValue}`, 10, 10);
+  ctx.fillText(estadoGlobal.pausado ? "PAUSA (espacio)" : "En marcha", 10, 28);
+}
+
+function drawBarraEstado() {
+  let presos = 0, motines = 0;
+  for (const n of npcs) {
+    if (n.tipo === "preso") {
+      presos++;
+      if (n.estado === "motin") motines++;
+    }
+  }
+
+  const fase = faseDelDia();
+  const txt = `Día ${estadoGlobal.dia} · ${horaDelDia()} (${fase.nombre})` +
+              `   Presos: ${presos}   Motines: ${motines}` +
+              `   Dinero: $${estadoGlobal.dinero}`;
+
+  ctx.font = "14px monospace";
+  ctx.textBaseline = "top";
+  const pad = 8;
+  const w = ctx.measureText(txt).width + pad * 2;
+  const h = 22;
+  const x = Math.floor((window.innerWidth - w) / 2);
+  const y = 10;
+
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.fillRect(x, y, w, h);
+
+  let color = "#e0e0e0";
+  if (motines > 0) color = "#ff6666";
+  if (estadoGlobal.dinero < 100) color = "#ffaa44";
+  ctx.fillStyle = color;
+  ctx.fillText(txt, x + pad, y + 4);
+}
+
+function drawTipoSeleccionado() {
+  const txt = `Tipo: ${tipoSeleccionado} ($${TIPOS_CELDA[tipoSeleccionado].coste})`;
+  ctx.font = "14px monospace";
+  ctx.textBaseline = "top";
+  const pad = 6;
+  const w = ctx.measureText(txt).width + pad * 2;
+  const h = 20;
+  const x = window.innerWidth - w - 10;
+  const y = 10;
+  ctx.fillStyle = "rgba(0,0,0,0.55)";
+  ctx.fillRect(x, y, w, h);
+  const col = TIPOS_CELDA[tipoSeleccionado].color;
+  if (col) {
+    ctx.fillStyle = col;
+    ctx.fillRect(x + 3, y + 4, 12, h - 8);
+  }
+  ctx.fillStyle = "#e0e0e0";
+  ctx.fillText(txt, x + (col ? 20 : pad), y + 3);
+}
+
+function drawGameOver() {
+  if (!estadoGlobal.gameOver) return;
+
+  ctx.fillStyle = "rgba(0,0,0,0.75)";
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+  ctx.fillStyle = "#ff4444";
+  ctx.font = "bold 48px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("GAME OVER", window.innerWidth / 2, window.innerHeight / 2 - 20);
+
+  ctx.fillStyle = "#e0e0e0";
+  ctx.font = "18px monospace";
+  ctx.fillText(
+    `Te quedaste sin dinero el Día ${estadoGlobal.dia - 1}`,
+    window.innerWidth / 2,
+    window.innerHeight / 2 + 30
+  );
+
+  ctx.textAlign = "start";
+  ctx.textBaseline = "top";
+}
+
+function drawPausaOverlay() {
+  if (!estadoGlobal.pausado || estadoGlobal.gameOver) return;
+  ctx.fillStyle = "rgba(0,0,0,0.35)";
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+  ctx.fillStyle = "#e0e0e0";
+  ctx.font = "bold 32px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("PAUSA", window.innerWidth / 2, window.innerHeight / 2);
+  ctx.textAlign = "start";
+  ctx.textBaseline = "top";
+}
+
+function draw() {
+  const off = getGridOffset();
+
+  // Fondo global
+  ctx.fillStyle = COLOR_BG;
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+  if (gridDirty) redibujarGridCache();
+  ctx.drawImage(gridCanvas, off.x, off.y);
+
+  // Tinte sutil de la fase del día (sobre el grid, bajo los NPCs)
+  const fase = faseDelDia();
+  ctx.fillStyle = fase.tinte;
+  ctx.fillRect(off.x, off.y, GRID_W, GRID_H);
+
+  // NPCs
+  for (const npc of npcs) {
+    dibujarNPC(ctx, npc, off.x, off.y);
+  }
+
+  drawFPS();
+  drawBarraEstado();
+  drawTipoSeleccionado();
+  drawPausaOverlay();
+  drawGameOver();
+}
+
+/* =========================================================
+   BUCLE PRINCIPAL
+   ========================================================= */
+let lastFrameTime = performance.now();
+
+function loop(now) {
+  const dtMs = now - lastFrameTime;
+  lastFrameTime = now;
+  const dt = Math.min(dtMs / 1000, 0.05);
+
+  // --- Ticks de simulación ---
+  let ticksRun = 0;
+  while (now - lastTick >= TICK_MS && ticksRun < 5) {
+    lastTick += TICK_MS;
+    tick();
+    ticksRun++;
+  }
+  if (now - lastTick >= TICK_MS) lastTick = now;
+
+  // --- Movimiento de NPCs (solo si no está pausado ni game over) ---
+  if (!estadoGlobal.pausado && !estadoGlobal.gameOver) {
+    for (const npc of npcs) actualizarMovimiento(npc, dt);
+  }
+
+  // --- FPS ---
+  fpsAccum += dtMs;
+  fpsFrames++;
+  if (fpsAccum >= 500) {
+    fpsValue = Math.round((fpsFrames * 1000) / fpsAccum);
+    fpsAccum = 0;
+    fpsFrames = 0;
+  }
+
+  // --- Render ---
+  draw();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

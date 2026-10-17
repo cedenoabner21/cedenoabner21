@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>MiniPrison — Base</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #1a1a2e;
+    overflow: hidden;
+    height: 100%;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script>
+"use strict";
+
+/* =========================================================
+   CONFIGURACIÓN GLOBAL
+   ========================================================= */
+const TILE = 40;              // tamaño de cada celda en píxeles
+const COLS = 20;              // celdas horizontales
+const ROWS = 15;              // celdas verticales
+const GRID_W = TILE * COLS;   // ancho lógico del grid
+const GRID_H = TILE * ROWS;   // alto lógico del grid
+
+const COLOR_BG = "#1a1a2e";
+const COLOR_GRID = "rgba(255,255,255,0.08)";
+
+const TICK_MS = 1000;         // intervalo de la simulación por ticks
+
+/* =========================================================
+   CANVAS A PANTALLA COMPLETA (con soporte HiDPI)
+   ========================================================= */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+// Ajusta el tamaño del canvas al tamaño de la ventana.
+// Usamos devicePixelRatio para que no se vea borroso en pantallas HiDPI.
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = Math.floor(window.innerWidth  * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+  canvas.style.width  = window.innerWidth  + "px";
+  canvas.style.height = window.innerHeight + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // escalado lógico
+}
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+/* =========================================================
+   INPUT DE TECLADO
+   ========================================================= */
+const keys = Object.create(null); // objeto sin prototipo, evita colisiones
+
+window.addEventListener("keydown", (e) => {
+  keys[e.key.toLowerCase()] = true;
+  // Evita que la barra espaciadora haga scroll si algún día hay scroll
+  if (e.key === " " || e.key.startsWith("Arrow")) e.preventDefault();
+});
+window.addEventListener("keyup", (e) => {
+  keys[e.key.toLowerCase()] = false;
+});
+// Al perder foco, limpiamos las teclas para evitar "teclas pegadas"
+window.addEventListener("blur", () => {
+  for (const k in keys) keys[k] = false;
+});
+
+/* =========================================================
+   SISTEMA DE TICKS (simulación 1 vez por segundo)
+   ========================================================= */
+let lastTick = performance.now();
+
+function tick() {
+  // TODO: aquí irá la lógica de simulación (NPCs, necesidades, IA…)
+  console.log("[tick]", performance.now().toFixed(0));
+}
+
+/* =========================================================
+   FPS
+   ========================================================= */
+let fpsAccum = 0;
+let fpsFrames = 0;
+let fpsValue = 0;
+
+/* =========================================================
+   DIBUJO
+   ========================================================= */
+function drawGrid() {
+  // Cálculo del centrado del grid dentro del canvas visible
+  const viewW = window.innerWidth;
+  const viewH = window.innerHeight;
+  const offsetX = Math.floor((viewW - GRID_W) / 2);
+  const offsetY = Math.floor((viewH - GRID_H) / 2);
+
+  // Fondo del área del grid (por si el grid no cubre toda la pantalla)
+  ctx.fillStyle = "#151526";
+  ctx.fillRect(offsetX, offsetY, GRID_W, GRID_H);
+
+  // Líneas del grid
+  ctx.strokeStyle = COLOR_GRID;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+
+  // Líneas verticales
+  for (let x = 0; x <= COLS; x++) {
+    const px = offsetX + x * TILE + 0.5; // +0.5 para líneas nítidas
+    ctx.moveTo(px, offsetY);
+    ctx.lineTo(px, offsetY + GRID_H);
+  }
+  // Líneas horizontales
+  for (let y = 0; y <= ROWS; y++) {
+    const py = offsetY + y * TILE + 0.5;
+    ctx.moveTo(offsetX, py);
+    ctx.lineTo(offsetX + GRID_W, py);
+  }
+  ctx.stroke();
+
+  // Borde exterior un poco más marcado
+  ctx.strokeStyle = "rgba(255,255,255,0.18)";
+  ctx.strokeRect(offsetX + 0.5, offsetY + 0.5, GRID_W, GRID_H);
+}
+
+function drawFPS() {
+  ctx.font = "14px monospace";
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#e0e0e0";
+  ctx.fillText(`FPS: ${fpsValue}`, 10, 10);
+}
+
+function draw() {
+  // Fondo global
+  ctx.fillStyle = COLOR_BG;
+  ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+
+  drawGrid();
+  drawFPS();
+}
+
+/* =========================================================
+   BUCLE PRINCIPAL (requestAnimationFrame + delta time)
+   ========================================================= */
+let lastFrameTime = performance.now();
+
+function loop(now) {
+  // Delta time en milisegundos (por si luego queremos animaciones suaves)
+  const dt = now - lastFrameTime;
+  lastFrameTime = now;
+
+  // --- TICKS de simulación ---
+  // Se ejecuta tantas veces como "TICK_MS" hayan pasado desde el último tick.
+  // Normalmente 1 por segundo; si el navegador se pausó, recupera los pendientes
+  // pero limitamos para evitar explosiones de ticks tras pestañas inactivas.
+  let ticksRun = 0;
+  while (now - lastTick >= TICK_MS && ticksRun < 5) {
+    lastTick += TICK_MS;
+    tick();
+    ticksRun++;
+  }
+  // Si acumulamos demasiado atraso, resincronizamos para no ir en bucle infinito
+  if (now - lastTick >= TICK_MS) lastTick = now;
+
+  // --- FPS ---
+  fpsAccum += dt;
+  fpsFrames++;
+  if (fpsAccum >= 500) { // refrescamos cada medio segundo
+    fpsValue = Math.round((fpsFrames * 1000) / fpsAccum);
+    fpsAccum = 0;
+    fpsFrames = 0;
+  }
+
+  // --- RENDER ---
+  draw();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
