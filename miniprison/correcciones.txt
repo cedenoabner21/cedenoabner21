@@ -1,0 +1,5 @@
+FPS bajos aprox.: 6-9 fps
+construccion de edificios != muros
+objetos basicos para que los presos satisfagan necesidades
+seleccion de personal para mmandarlo a una ubicacion
+guardias deben estar cerca a presos en radio de 8 celdas
